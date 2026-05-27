@@ -1,0 +1,28 @@
+# ── Python ─────────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.Python
+
+# ── Secrets ────────────────────────────────────────────────────────────────────
+.env
+
+# ── Generated / personal data  (directories kept via .gitkeep) ────────────────
+chats/*.json
+transcriptions/*.md
+audio_in/*
+!audio_in/.gitkeep
+
+# ── OS ─────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDEs ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
