@@ -1,4 +1,4 @@
-# AI Research Agent
+# AI Agent with tools
 
 A local-first AI agent built with **LangGraph + Ollama** that can search the web, run Python code, transcribe audio, and manage files — all running on your own machine.
 
