@@ -16,6 +16,9 @@ pydantic>=2.0.0
 # UI
 streamlit>=1.40.0
 
+# Observability
+langsmith>=0.1.0
+
 # Dev & testing
 pytest>=8.0.0
 python-dotenv>=1.0.0

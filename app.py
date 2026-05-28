@@ -122,6 +122,10 @@ if "selected_model" not in st.session_state:
     st.session_state.selected_model = models[0] if models else "llama3.2"
 if "agent" not in st.session_state:
     st.session_state.agent = build_agent(model_name=st.session_state.selected_model)
+if "saved_uploads" not in st.session_state:
+    # Tracks filenames already written to audio_in/ this session to prevent
+    # double-saves when Streamlit reruns with the uploader widget still populated.
+    st.session_state.saved_uploads = set()
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -157,6 +161,14 @@ with st.sidebar:
         st.session_state.available_models = get_ollama_models()
         st.rerun()
 
+    # LangSmith tracing status
+    _tracing = os.environ.get("LANGCHAIN_TRACING_V2", "").lower() == "true"
+    if _tracing:
+        _project = os.environ.get("LANGCHAIN_PROJECT", "default")
+        st.success(f"🔍 LangSmith tracing · `{_project}`")
+    else:
+        st.caption("🔍 LangSmith tracing off")
+
     st.divider()
 
     # --- Conversation controls ---
@@ -180,6 +192,21 @@ with st.sidebar:
 
     # --- Audio transcription ---
     st.header("🎙️ Transcription")
+
+    # Upload widget — saves directly to audio_in/
+    uploaded = st.file_uploader(
+        "Upload audio",
+        type=["m4a", "mp3", "wav", "mp4", "ogg", "flac", "webm"],
+        label_visibility="collapsed",
+        key="audio_uploader",
+    )
+    if uploaded is not None and uploaded.name not in st.session_state.saved_uploads:
+        os.makedirs(AUDIO_IN_DIR, exist_ok=True)
+        dest = os.path.join(AUDIO_IN_DIR, uploaded.name)
+        with open(dest, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.session_state.saved_uploads.add(uploaded.name)
+        st.rerun()  # refresh file list; uploader stays populated but won't re-save
 
     audio_files = []
     if os.path.exists(AUDIO_IN_DIR):

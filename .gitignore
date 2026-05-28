@@ -17,6 +17,7 @@ chats/*.json
 transcriptions/*.md
 audio_in/*
 !audio_in/.gitkeep
+reports/*.md
 
 # ── OS ─────────────────────────────────────────────────────────────────────────
 .DS_Store
