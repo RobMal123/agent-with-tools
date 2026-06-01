@@ -19,6 +19,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from state import AgentState
 from tools import TOOLS
 from prompts import SYSTEM_PROMPT
+from memory import format_memories_for_prompt
 
 
 def build_agent(model_name: str = "llama3.2", use_memory: bool = True):
@@ -44,8 +45,15 @@ def build_agent(model_name: str = "llama3.2", use_memory: bool = True):
         """
         The 'think' node. Calls the LLM with the full conversation history.
         The LLM either responds with text (done) or requests a tool call.
+
+        Long-term memories are loaded fresh on every call so the LLM always
+        sees the latest facts without needing a full rebuild.
         """
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(state["messages"])
+        memory_ctx = format_memories_for_prompt()
+        system_content = (
+            f"{SYSTEM_PROMPT}\n\n{memory_ctx}" if memory_ctx else SYSTEM_PROMPT
+        )
+        messages = [SystemMessage(content=system_content)] + list(state["messages"])
         response = llm_with_tools.invoke(messages)
         return {"messages": [response]}
 

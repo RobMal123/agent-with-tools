@@ -4,10 +4,13 @@ from langchain_core.tools import tool
 from langchain_community.utilities.brave_search import BraveSearchWrapper
 from langchain_experimental.tools import PythonREPLTool
 
+from memory import load_memories, save_memory_entry, delete_memory_entry
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
 AUDIO_IN_DIR       = os.path.join(_BASE_DIR, "audio_in")
 TRANSCRIPTIONS_DIR = os.path.join(_BASE_DIR, "transcriptions")
+_CHROMA_DIR        = os.path.join(_BASE_DIR, "chroma_db")
 
 
 # --- Web Search ---
@@ -201,6 +204,9 @@ def transcribe_audio(file_path: str) -> str:
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
 
+        # Auto-index the transcript so it's searchable immediately
+        _auto_index(md_path)
+
         return (
             f"Transcription complete.\n"
             f"Language: {language} | Saved to: {md_path}\n\n"
@@ -211,5 +217,200 @@ def transcribe_audio(file_path: str) -> str:
         return f"Error during transcription: {e}"
 
 
+# ── Long-term memory tools ─────────────────────────────────────────────────────
+
+@tool
+def save_memory(key: str, value: str) -> str:
+    """
+    Save a fact or preference about the user to long-term memory.
+    This persists across ALL conversations — use it to remember names,
+    preferences, context, or anything the user asks you to keep in mind.
+
+    Examples:
+        save_memory("user_name", "Rob")
+        save_memory("preferred_language", "Python")
+        save_memory("company", "Acme Corp")
+
+    Use a short snake_case key and a concise value.
+    """
+    save_memory_entry(key, value)
+    return f"Remembered: {key} = {value}"
+
+
+@tool
+def list_memories() -> str:
+    """
+    List all facts currently stored in long-term memory.
+    Call this to recall what you know about the user before answering
+    questions where personal context matters.
+    """
+    memories = load_memories()
+    if not memories:
+        return "No memories stored yet."
+    lines = [f"- **{k}**: {v}" for k, v in memories.items()]
+    return "**Long-term memories:**\n" + "\n".join(lines)
+
+
+@tool
+def delete_memory(key: str) -> str:
+    """
+    Delete a specific fact from long-term memory by its key.
+    Use list_memories first to see which keys exist.
+    """
+    removed = delete_memory_entry(key)
+    if removed:
+        return f"Deleted memory: '{key}'"
+    return f"No memory found with key '{key}'. Use list_memories to see available keys."
+
+
+# ── Semantic search (RAG) ──────────────────────────────────────────────────────
+# Uses ChromaDB (local, embedded, no server) + Ollama embeddings.
+# Default embedding model: nomic-embed-text (must be pulled: ollama pull nomic-embed-text)
+# Override with EMBED_MODEL env var.
+
+_vectorstore_cache: dict = {}
+
+
+def _get_vectorstore():
+    """Lazy-load and cache the ChromaDB vector store. Returns (store, error_str)."""
+    if "store" not in _vectorstore_cache:
+        try:
+            from langchain_chroma import Chroma
+            from langchain_ollama import OllamaEmbeddings
+
+            embed_model = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+            base_url    = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+            embeddings  = OllamaEmbeddings(model=embed_model, base_url=base_url)
+            _vectorstore_cache["store"] = Chroma(
+                collection_name="agent_docs",
+                embedding_function=embeddings,
+                persist_directory=_CHROMA_DIR,
+            )
+        except ImportError as e:
+            return None, f"Missing dependency: {e}. Run: pip install langchain-chroma"
+        except Exception as e:
+            return None, f"Failed to initialise vector store: {e}"
+    return _vectorstore_cache["store"], None
+
+
+def _index_file(abs_path: str) -> str:
+    """
+    Core indexing logic — chunks a file and upserts it into ChromaDB.
+    Returns a human-readable status string.
+    """
+    try:
+        with open(abs_path, encoding="utf-8") as f:
+            text = f.read()
+    except Exception as e:
+        return f"Error reading '{abs_path}': {e}"
+
+    store, err = _get_vectorstore()
+    if err:
+        return f"Error: {err}"
+
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+        chunks   = splitter.create_documents(
+            [text],
+            metadatas=[{"source": abs_path, "indexed_at": datetime.now().isoformat()}],
+        )
+
+        # Remove stale chunks from this source before re-indexing
+        try:
+            store._collection.delete(where={"source": abs_path})
+        except Exception:
+            pass
+
+        store.add_documents(chunks)
+        return f"Indexed {len(chunks)} chunk(s) from: {os.path.basename(abs_path)}"
+    except Exception as e:
+        return f"Error indexing '{abs_path}': {e}"
+
+
+def _auto_index(abs_path: str) -> None:
+    """Silently index a file after it's created (e.g. after transcription). Non-fatal."""
+    try:
+        _index_file(abs_path)
+    except Exception:
+        pass
+
+
+@tool
+def index_document(file_path: str) -> str:
+    """
+    Add a local text or Markdown file to the semantic search index so it can
+    be found with search_documents later.
+
+    Paths are relative to the project folder, e.g.:
+        index_document("transcriptions/meeting.md")
+        index_document("reports/research.md")
+
+    Re-indexing the same file is safe — old chunks are replaced automatically.
+    Requires the Ollama nomic-embed-text model:  ollama pull nomic-embed-text
+    """
+    allowed = {".txt", ".md", ".py", ".json", ".csv"}
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in allowed:
+        return f"Error: only {allowed} files can be indexed."
+
+    abs_path = os.path.abspath(file_path)
+    if not os.path.exists(abs_path):
+        alt = os.path.join(_BASE_DIR, file_path)
+        if os.path.exists(alt):
+            abs_path = alt
+        else:
+            return f"Error: file not found — tried '{file_path}' and relative to project root."
+
+    return _index_file(abs_path)
+
+
+@tool
+def search_documents(query: str) -> str:
+    """
+    Search across all indexed documents (transcriptions, notes, reports) using
+    semantic similarity. Returns the most relevant passages with their source files.
+
+    Use this to answer questions about past meetings, saved research, or any
+    content that has been indexed with index_document.
+
+    Requires at least one document to have been indexed first.
+    """
+    store, err = _get_vectorstore()
+    if err:
+        return f"Error: {err}"
+
+    try:
+        results = store.similarity_search(query, k=4)
+    except Exception as e:
+        return f"Error during search: {e}"
+
+    if not results:
+        return (
+            "No relevant documents found. "
+            "Use index_document to add files to the search index first."
+        )
+
+    parts = []
+    for i, doc in enumerate(results, 1):
+        source_name = os.path.basename(doc.metadata.get("source", "unknown"))
+        parts.append(f"**[{i}] {source_name}**\n{doc.page_content}")
+
+    return "\n\n---\n\n".join(parts)
+
+
 # Export all tools as a list — this is what the agent will use
-TOOLS = [brave_search, python_repl, list_directory, read_file, write_md_file, transcribe_audio]
+TOOLS = [
+    brave_search,
+    python_repl,
+    list_directory,
+    read_file,
+    write_md_file,
+    transcribe_audio,
+    save_memory,
+    list_memories,
+    delete_memory,
+    index_document,
+    search_documents,
+]

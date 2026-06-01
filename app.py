@@ -9,6 +9,7 @@ import uuid
 import json
 import os
 import sys
+import base64
 from datetime import datetime
 from langchain_core.messages import HumanMessage, AIMessage
 from dotenv import load_dotenv
@@ -16,6 +17,8 @@ from dotenv import load_dotenv
 load_dotenv()  # must run before graph/tools are imported so env vars are set
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from graph import build_agent
+from memory import load_memories, delete_memory_entry, clear_all_memories
+from tools import _index_file
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 _BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -52,15 +55,26 @@ def _existing_created_at(path: str) -> str:
 
 
 def save_chat(thread_id: str, title: str, model: str, messages: list) -> None:
-    """Persist the current conversation to chats/<thread_id>.json."""
+    """Persist the current conversation to chats/<thread_id>.json.
+    Image bytes are stripped before saving to keep JSON files small;
+    a note is appended to the message text so the history is still readable.
+    """
     path = os.path.join(CHATS_DIR, f"{thread_id}.json")
+    clean_messages = []
+    for m in messages:
+        if "image_b64" in m:
+            stripped = {k: v for k, v in m.items() if k not in ("image_b64", "image_mime")}
+            stripped["content"] = stripped["content"] + " *(image attached)*"
+            clean_messages.append(stripped)
+        else:
+            clean_messages.append(m)
     data = {
         "thread_id": thread_id,
         "title": title,
         "model": model,
         "created_at": _existing_created_at(path),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "messages": messages,
+        "messages": clean_messages,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -193,20 +207,39 @@ with st.sidebar:
     # --- Audio transcription ---
     st.header("🎙️ Transcription")
 
-    # Upload widget — saves directly to audio_in/
+    # Upload widget — shows a naming form before saving
     uploaded = st.file_uploader(
         "Upload audio",
         type=["m4a", "mp3", "wav", "mp4", "ogg", "flac", "webm"],
         label_visibility="collapsed",
         key="audio_uploader",
     )
-    if uploaded is not None and uploaded.name not in st.session_state.saved_uploads:
-        os.makedirs(AUDIO_IN_DIR, exist_ok=True)
-        dest = os.path.join(AUDIO_IN_DIR, uploaded.name)
-        with open(dest, "wb") as f:
-            f.write(uploaded.getbuffer())
-        st.session_state.saved_uploads.add(uploaded.name)
-        st.rerun()  # refresh file list; uploader stays populated but won't re-save
+    if uploaded is not None:
+        # Use name+size as a dedup key so the form doesn't re-appear after saving
+        _upload_key = f"{uploaded.name}_{uploaded.size}"
+        if _upload_key not in st.session_state.saved_uploads:
+            # Show naming form
+            _default_stem = os.path.splitext(uploaded.name)[0]
+            _ext          = os.path.splitext(uploaded.name)[1].lower()
+            _date_str     = datetime.now().strftime("%Y-%m-%d")
+            _custom_name  = st.text_input(
+                "Recording name",
+                value=_default_stem,
+                key="audio_custom_name",
+                placeholder="e.g. Morgonmöte",
+                help="Date is added automatically: name-YYYY-MM-DD",
+            )
+            st.caption(f"Will save as: **{_custom_name.strip() or '…'}-{_date_str}{_ext}**")
+            if st.button("💾 Save to audio_in/", use_container_width=True, key="save_audio_btn"):
+                if _custom_name.strip():
+                    _final_name = f"{_custom_name.strip()}-{_date_str}{_ext}"
+                    os.makedirs(AUDIO_IN_DIR, exist_ok=True)
+                    with open(os.path.join(AUDIO_IN_DIR, _final_name), "wb") as _f:
+                        _f.write(uploaded.getbuffer())
+                    st.session_state.saved_uploads.add(_upload_key)
+                    st.rerun()
+                else:
+                    st.error("Please enter a name before saving.")
 
     audio_files = []
     if os.path.exists(AUDIO_IN_DIR):
@@ -275,6 +308,45 @@ with st.sidebar:
 
     st.divider()
 
+    # --- Long-term memory ---
+    _memories = load_memories()
+    st.header(f"🧠 Memory ({len(_memories)})")
+
+    if not _memories:
+        st.caption("No memories yet. Tell the agent: *'Remember that my name is …'*")
+    else:
+        for _key, _val in list(_memories.items()):
+            col_info, col_del = st.columns([4, 1])
+            with col_info:
+                st.caption(f"**{_key}**: {_val}")
+            with col_del:
+                if st.button("🗑", key=f"mem_del_{_key}", use_container_width=True,
+                             help=f"Forget '{_key}'"):
+                    delete_memory_entry(_key)
+                    st.rerun()
+
+    _col_idx, _col_clr = st.columns(2)
+    with _col_idx:
+        if st.button("📚 Index docs", use_container_width=True,
+                     help="Index transcriptions/ and reports/ for semantic search"):
+            _indexed = 0
+            for _dir in ["transcriptions", "reports"]:
+                _dp = os.path.join(_BASE_DIR, _dir)
+                if os.path.exists(_dp):
+                    for _fn in sorted(os.listdir(_dp)):
+                        if _fn.endswith(".md"):
+                            _index_file(os.path.join(_dp, _fn))
+                            _indexed += 1
+            st.success(f"Indexed {_indexed} file(s)")
+    with _col_clr:
+        if st.button("🗑 Clear all", use_container_width=True,
+                     help="Delete ALL stored memories"):
+            n = clear_all_memories()
+            st.success(f"Cleared {n} memory/memories")
+            st.rerun()
+
+    st.divider()
+
     # --- Examples ---
     st.header("💡 Examples")
     examples = [
@@ -291,26 +363,54 @@ with st.sidebar:
 # ── Caption ────────────────────────────────────────────────────────────────────
 st.caption(
     f"Model: `{st.session_state.selected_model}` · "
-    "Tools: Brave Search · Python REPL · Browse Dir · Read File · Write MD · Transcribe Audio"
+    "Tools: Brave Search · Python REPL · Browse Dir · Read File · Write MD · Transcribe Audio · Memory · RAG"
 )
 
 # ── Chat display ───────────────────────────────────────────────────────────────
 for msg in st.session_state.display_messages:
     with st.chat_message(msg["role"]):
+        if msg.get("image_b64"):
+            st.image(base64.b64decode(msg["image_b64"]), use_container_width=True)
         st.markdown(msg["content"])
         if msg.get("tools_used"):
             st.caption(f"🔧 Tools used: {', '.join(msg['tools_used'])}")
 
 # ── Chat input ─────────────────────────────────────────────────────────────────
+
+# Image attachment — sits above the chat input bar
+attached_image = st.file_uploader(
+    "📎 Attach an image (optional — vision models only)",
+    type=["png", "jpg", "jpeg", "webp", "gif"],
+    key="chat_image_upload",
+    label_visibility="collapsed",
+)
+
 user_input = st.chat_input("Ask me anything...")
 if hasattr(st.session_state, "pending_input"):
     user_input = st.session_state.pending_input
     del st.session_state.pending_input
 
 if user_input:
+    # Build LangChain message — multimodal when an image is attached
+    if attached_image is not None:
+        img_bytes = attached_image.getvalue()
+        img_b64   = base64.b64encode(img_bytes).decode()
+        mime      = attached_image.type or "image/png"
+        lc_content = [
+            {"type": "text", "text": user_input},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+        ]
+        user_display = {"role": "user", "content": user_input,
+                        "image_b64": img_b64, "image_mime": mime}
+    else:
+        lc_content   = user_input
+        user_display = {"role": "user", "content": user_input}
+
     # Show user message immediately
-    st.session_state.display_messages.append({"role": "user", "content": user_input})
+    st.session_state.display_messages.append(user_display)
     with st.chat_message("user"):
+        if attached_image is not None:
+            st.image(attached_image, use_container_width=True)
         st.markdown(user_input)
 
     # Run agent
@@ -318,7 +418,7 @@ if user_input:
         with st.spinner("Thinking..."):
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
             result = st.session_state.agent.invoke(
-                {"messages": [HumanMessage(content=user_input)]},
+                {"messages": [HumanMessage(content=lc_content)]},
                 config=config,
             )
 

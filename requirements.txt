@@ -5,6 +5,10 @@ langchain-ollama>=0.2.0
 langchain-community>=0.3.0
 langchain-experimental>=0.3.0  # For PythonREPLTool
 
+# Memory / RAG
+chromadb>=0.5.0
+langchain-chroma>=0.1.0
+
 # Audio transcription (local Whisper model — also needs ffmpeg on PATH)
 faster-whisper>=1.1.0
 

@@ -19,6 +19,10 @@ audio_in/*
 !audio_in/.gitkeep
 reports/*.md
 
+# ── Memory & vector store ───────────────────────────────────────────────────────
+memory.json
+chroma_db/
+
 # ── OS ─────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
@@ -27,3 +31,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+.pytest_cache/
