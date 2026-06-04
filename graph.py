@@ -17,7 +17,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
 from state import AgentState
-from tools import TOOLS
+from tools import TOOLS, set_agent_model
 from prompts import SYSTEM_PROMPT
 from memory import format_memories_for_prompt
 
@@ -35,12 +35,15 @@ def build_agent(model_name: str = "llama3.2", use_memory: bool = True):
         A compiled LangGraph app ready to invoke.
     """
 
-    # 1. Set up the LLM and bind tools to it
+    # 1. Keep tools.py in sync so structure_thoughts etc. use the right model
+    set_agent_model(model_name)
+
+    # 2. Set up the LLM and bind tools to it
     base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     llm = ChatOllama(model=model_name, temperature=0, base_url=base_url)
     llm_with_tools = llm.bind_tools(TOOLS)
 
-    # 2. Define the node functions
+    # 3. Define the node functions
     def call_model(state: AgentState) -> AgentState:
         """
         The 'think' node. Calls the LLM with the full conversation history.

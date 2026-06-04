@@ -23,6 +23,22 @@ reports/*.md
 memory.json
 chroma_db/
 
+# ── Knowledge base (keep folder skeletons, ignore content) ─────────────────────
+knowledge/meetings/*
+!knowledge/meetings/.gitkeep
+knowledge/ideas/*
+!knowledge/ideas/.gitkeep
+knowledge/projects/*
+!knowledge/projects/.gitkeep
+knowledge/reports/*
+!knowledge/reports/.gitkeep
+knowledge/improvements/*
+!knowledge/improvements/.gitkeep
+
+# ── Sandboxed REPL workspace ────────────────────────────────────────────────────
+workspace/*
+!workspace/.gitkeep
+
 # ── OS ─────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
@@ -33,3 +49,6 @@ Thumbs.db
 *.swp
 
 .pytest_cache/
+
+todo/*.md
+notes

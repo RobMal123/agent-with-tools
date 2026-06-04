@@ -1,26 +1,79 @@
+"""
+tools.py — All tool definitions + TOOLS list
+
+Adding a new tool: define it with @tool here, append to TOOLS at the bottom.
+The agent picks it up automatically — no changes to graph.py needed.
+"""
+
 import os
+import re
+import json
 from datetime import datetime
+
 from langchain_core.tools import tool
 from langchain_community.utilities.brave_search import BraveSearchWrapper
 from langchain_experimental.tools import PythonREPLTool
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage as _HM
 
 from memory import load_memories, save_memory_entry, delete_memory_entry
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
-AUDIO_IN_DIR       = os.path.join(_BASE_DIR, "audio_in")
+
+# ── Paths ───────────────────────────────────────────────────────────────────────
+_BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+AUDIO_IN_DIR     = os.path.join(_BASE_DIR, "audio_in")
+KNOWLEDGE_DIR    = os.path.join(_BASE_DIR, "knowledge")
+MEETINGS_DIR     = os.path.join(KNOWLEDGE_DIR, "meetings")
+IDEAS_DIR        = os.path.join(KNOWLEDGE_DIR, "ideas")
+PROJECTS_DIR     = os.path.join(KNOWLEDGE_DIR, "projects")
+REPORTS_DIR      = os.path.join(KNOWLEDGE_DIR, "reports")
+IMPROVEMENTS_DIR = os.path.join(KNOWLEDGE_DIR, "improvements")
+WORKSPACE_DIR    = os.path.join(_BASE_DIR, "workspace")
+_CHROMA_DIR      = os.path.join(_BASE_DIR, "chroma_db")
+# Legacy — kept so existing files in transcriptions/ still resolve via read_file
 TRANSCRIPTIONS_DIR = os.path.join(_BASE_DIR, "transcriptions")
-_CHROMA_DIR        = os.path.join(_BASE_DIR, "chroma_db")
+
+# Ensure all runtime directories exist at import time
+for _d in (MEETINGS_DIR, IDEAS_DIR, PROJECTS_DIR, REPORTS_DIR,
+           IMPROVEMENTS_DIR, WORKSPACE_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 
-# --- Web Search ---
-# Brave Search API — get a free key at https://brave.com/search/api/
+# ── Agent model tracking ────────────────────────────────────────────────────────
+# build_agent() in graph.py calls set_agent_model() so tools that spin up a
+# secondary LLM (structure_thoughts, analyze_improvements) use the right model.
+
+_AGENT_MODEL: str = "llama3.2"
+_structure_llm_cache: dict = {}
+
+
+def set_agent_model(name: str) -> None:
+    """Called by build_agent() whenever the active Ollama model changes."""
+    global _AGENT_MODEL
+    _AGENT_MODEL = name
+    _structure_llm_cache.clear()          # force rebuild on next call
+
+
+def _get_structure_llm() -> ChatOllama:
+    """Lazy-load a dedicated temperature=0 LLM for structured-output tools."""
+    if _structure_llm_cache.get("model") != _AGENT_MODEL:
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        _structure_llm_cache["llm"]   = ChatOllama(
+            model=_AGENT_MODEL, temperature=0, base_url=base_url
+        )
+        _structure_llm_cache["model"] = _AGENT_MODEL
+    return _structure_llm_cache["llm"]
+
+
+# ── Web Search ───────────────────────────────────────────────────────────────────
 # Wrapped with @tool so Ollama models receive an explicit `query` parameter
 # schema instead of the generic `value` arg that pre-built tools expose.
+
 _brave = BraveSearchWrapper(
     api_key=os.environ.get("BRAVE_SEARCH_API_KEY", ""),
     search_kwargs={"count": 3},
 )
+
 
 @tool
 def brave_search(query: str) -> str:
@@ -28,13 +81,28 @@ def brave_search(query: str) -> str:
     return _brave.run(query)
 
 
-# --- Python REPL ---
-# Lets the agent write and run Python code for calculations, data analysis, etc.
-# WARNING: only use in sandboxed environments in production!
-python_repl = PythonREPLTool()
+# ── Python REPL (sandboxed to workspace/) ───────────────────────────────────────
+# The working directory is pinned to workspace/ so generated files stay contained.
+# Python state (variables, imports) persists across calls in the same session.
+
+_repl_instance = PythonREPLTool()
 
 
-# --- File tools ---
+@tool
+def python_repl(code: str) -> str:
+    """
+    Write and execute Python code for calculations, data analysis, or file generation.
+    Working directory is sandboxed to workspace/ — files written to disk appear there.
+    State (variables, imports) persists across calls within the same session.
+    """
+    sandboxed = (
+        f"import os; os.makedirs({repr(WORKSPACE_DIR)}, exist_ok=True); "
+        f"os.chdir({repr(WORKSPACE_DIR)})\n{code}"
+    )
+    return _repl_instance.run(sandboxed)
+
+
+# ── File tools ───────────────────────────────────────────────────────────────────
 
 @tool
 def read_file(file_path: str) -> str:
@@ -55,7 +123,6 @@ def read_file(file_path: str) -> str:
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
-        # Limit to ~8000 chars to stay within context window
         if len(content) > 8000:
             return content[:8000] + "\n\n[...file truncated at 8000 characters]"
         return content
@@ -68,14 +135,14 @@ def write_md_file(file_path: str, content: str) -> str:
     """
     Create or overwrite a Markdown (.md) file with the given content.
     Use this to save notes, summaries, reports, or research findings to disk.
-    The file_path must end with .md (e.g. 'notes.md' or 'reports/summary.md').
+    The file_path must end with .md — e.g. 'notes.md' or 'knowledge/reports/summary.md'.
     Parent directories are created automatically if they do not exist.
     """
     if not file_path.endswith(".md"):
         return "Error: file_path must end with .md"
 
     abs_path = os.path.abspath(file_path)
-    parent = os.path.dirname(abs_path)
+    parent   = os.path.dirname(abs_path)
 
     try:
         if parent:
@@ -87,36 +154,34 @@ def write_md_file(file_path: str, content: str) -> str:
         return f"Error writing file: {str(e)}"
 
 
-# --- Directory browser ---
+# ── Directory browser ────────────────────────────────────────────────────────────
 
 @tool
 def list_directory(path: str = ".") -> str:
     """
     List the files and folders inside a directory.
     Defaults to the project root (".") if no path is given.
-    Use this to discover what files exist before reading them.
-    Paths are relative to the project folder (e.g. "transcriptions", "audio_in").
+    Paths are relative to the project folder, e.g. "knowledge/meetings", "knowledge/improvements".
     Returns each entry with its type (file/dir), size in KB, and last-modified date.
     """
-    # Resolve relative to project root so short paths like "transcriptions" just work
     target = os.path.join(_BASE_DIR, path) if not os.path.isabs(path) else path
     target = os.path.normpath(target)
 
     if not os.path.exists(target):
         return f"Error: path not found — '{target}'"
     if not os.path.isdir(target):
-        return f"Error: '{target}' is a file, not a directory. Use read_file to read it."
+        return f"Error: '{target}' is a file. Use read_file to read it."
 
     entries = []
     try:
         for name in sorted(os.listdir(target)):
-            full = os.path.join(target, name)
-            kind = "dir " if os.path.isdir(full) else "file"
-            size_kb = os.path.getsize(full) / 1024 if os.path.isfile(full) else 0
+            full  = os.path.join(target, name)
+            kind  = "dir " if os.path.isdir(full) else "file"
             mtime = datetime.fromtimestamp(os.path.getmtime(full)).strftime("%Y-%m-%d %H:%M")
             if os.path.isdir(full):
                 entries.append(f"[{kind}]  {name}/  ({mtime})")
             else:
+                size_kb = os.path.getsize(full) / 1024
                 entries.append(f"[{kind}]  {name}  {size_kb:.1f} KB  ({mtime})")
     except PermissionError:
         return f"Error: permission denied reading '{target}'"
@@ -124,16 +189,16 @@ def list_directory(path: str = ".") -> str:
     if not entries:
         return f"Directory '{target}' is empty."
 
-    header = f"Contents of: {target}\n" + "─" * 60
-    return header + "\n" + "\n".join(entries)
+    return f"Contents of: {target}\n" + "─" * 60 + "\n" + "\n".join(entries)
 
 
-# --- Audio transcription ---
+# ── Audio transcription ──────────────────────────────────────────────────────────
 # Uses faster-whisper (local, CPU-friendly, int8 quantised).
-# Model is lazy-loaded and cached so it only downloads/loads once per session.
-# Default model: "small" (~970 MB).  Override with WHISPER_MODEL env var.
+# Model is lazy-loaded and cached; default: "small" (~970 MB).
+# Override with WHISPER_MODEL env var.
 
 _whisper_cache: dict = {}
+
 
 def _get_whisper_model():
     """Lazy-load and cache the faster-whisper model."""
@@ -157,19 +222,14 @@ def transcribe_audio(file_path: str) -> str:
     Transcribe an audio file to text using the local Whisper model (runs fully offline).
     Supported formats: .m4a, .mp3, .wav, .mp4, .ogg, .flac, .webm
 
-    The raw transcription is saved automatically to transcriptions/<stem>.md.
-    Returns the full transcription text so you can analyse it, create a meeting
-    summary, extract action items, etc.
-
-    Paths are resolved relative to the project folder, so you can pass just
-    'audio_in/meeting.m4a' without a full absolute path.
+    The raw transcription is saved to knowledge/meetings/<stem>.md and auto-indexed
+    for semantic search. Returns the full transcription text.
     """
     supported = {".m4a", ".mp3", ".wav", ".mp4", ".ogg", ".flac", ".webm"}
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in supported:
         return f"Error: unsupported format '{ext}'. Supported: {', '.join(sorted(supported))}"
 
-    # Resolve path — try as-is, then relative to the project directory
     abs_path = os.path.abspath(file_path)
     if not os.path.exists(abs_path):
         alt = os.path.join(_BASE_DIR, file_path)
@@ -184,28 +244,23 @@ def transcribe_audio(file_path: str) -> str:
 
     try:
         segments, info = model.transcribe(abs_path, beam_size=5)
-        # Consume the generator (transcription happens here)
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+        text     = " ".join(seg.text.strip() for seg in segments).strip()
         language = info.language
 
-        # Save raw transcription as .md
-        stem = os.path.splitext(os.path.basename(abs_path))[0]
-        os.makedirs(TRANSCRIPTIONS_DIR, exist_ok=True)
-        md_path = os.path.join(TRANSCRIPTIONS_DIR, f"{stem}.md")
+        stem      = os.path.splitext(os.path.basename(abs_path))[0]
+        md_path   = os.path.join(MEETINGS_DIR, f"{stem}.md")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         md_content = (
             f"# Transcription: {stem}\n\n"
             f"**Date:** {timestamp}  \n"
             f"**Language detected:** {language}  \n"
             f"**Source:** {abs_path}\n\n"
-            f"---\n\n"
-            f"{text}\n"
+            f"---\n\n{text}\n"
         )
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
 
-        # Auto-index the transcript so it's searchable immediately
-        _auto_index(md_path)
+        _auto_index(md_path, "meeting")
 
         return (
             f"Transcription complete.\n"
@@ -217,7 +272,7 @@ def transcribe_audio(file_path: str) -> str:
         return f"Error during transcription: {e}"
 
 
-# ── Long-term memory tools ─────────────────────────────────────────────────────
+# ── Long-term memory tools ───────────────────────────────────────────────────────
 
 @tool
 def save_memory(key: str, value: str) -> str:
@@ -263,9 +318,9 @@ def delete_memory(key: str) -> str:
     return f"No memory found with key '{key}'. Use list_memories to see available keys."
 
 
-# ── Semantic search (RAG) ──────────────────────────────────────────────────────
-# Uses ChromaDB (local, embedded, no server) + Ollama embeddings.
-# Default embedding model: nomic-embed-text (must be pulled: ollama pull nomic-embed-text)
+# ── Semantic search (RAG) ────────────────────────────────────────────────────────
+# Uses ChromaDB (local, embedded) + Ollama embeddings.
+# Default model: nomic-embed-text  →  ollama pull nomic-embed-text
 # Override with EMBED_MODEL env var.
 
 _vectorstore_cache: dict = {}
@@ -293,9 +348,37 @@ def _get_vectorstore():
     return _vectorstore_cache["store"], None
 
 
-def _index_file(abs_path: str) -> str:
+def _infer_doc_type(abs_path: str, doc_type: str = "") -> str:
+    """Infer document type from the file's parent folder, or use an explicit override."""
+    if doc_type:
+        return doc_type
+    parent = os.path.basename(os.path.dirname(abs_path)).lower()
+    return {
+        "meetings":     "meeting",
+        "ideas":        "idea",
+        "projects":     "project",
+        "reports":      "report",
+        "improvements": "improvement",
+        "transcriptions": "meeting",   # legacy folder
+    }.get(parent, "document")
+
+
+def _infer_date(abs_path: str) -> str:
+    """Infer date from a YYYY-MM-DD pattern in the filename, or fall back to mtime."""
+    stem = os.path.splitext(os.path.basename(abs_path))[0]
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", stem)
+    if m:
+        return m.group(1)
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(abs_path)).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def _index_file(abs_path: str, doc_type: str = "") -> str:
     """
-    Core indexing logic — chunks a file and upserts it into ChromaDB.
+    Chunk a file and upsert into ChromaDB with type/date metadata.
+    Public helper so app.py can call it directly.
     Returns a human-readable status string.
     """
     try:
@@ -308,51 +391,61 @@ def _index_file(abs_path: str) -> str:
     if err:
         return f"Error: {err}"
 
+    inferred_type = _infer_doc_type(abs_path, doc_type)
+    inferred_date = _infer_date(abs_path)
+
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
         chunks   = splitter.create_documents(
             [text],
-            metadatas=[{"source": abs_path, "indexed_at": datetime.now().isoformat()}],
+            metadatas=[{
+                "source":     abs_path,
+                "type":       inferred_type,
+                "date":       inferred_date,
+                "indexed_at": datetime.now().isoformat(),
+            }],
         )
 
-        # Remove stale chunks from this source before re-indexing
+        # Upsert: remove stale chunks for this source, then re-add
         try:
             store._collection.delete(where={"source": abs_path})
         except Exception:
             pass
 
         store.add_documents(chunks)
-        return f"Indexed {len(chunks)} chunk(s) from: {os.path.basename(abs_path)}"
+        return (
+            f"Indexed {len(chunks)} chunk(s) "
+            f"[type={inferred_type}, date={inferred_date}] "
+            f"from: {os.path.basename(abs_path)}"
+        )
     except Exception as e:
         return f"Error indexing '{abs_path}': {e}"
 
 
-def _auto_index(abs_path: str) -> None:
-    """Silently index a file after it's created (e.g. after transcription). Non-fatal."""
+def _auto_index(abs_path: str, doc_type: str = "") -> None:
+    """Silently index a file after creation. Non-fatal — errors are swallowed."""
     try:
-        _index_file(abs_path)
+        _index_file(abs_path, doc_type)
     except Exception:
         pass
 
 
 @tool
-def index_document(file_path: str) -> str:
+def index_document(file_path: str, doc_type: str = "") -> str:
     """
-    Add a local text or Markdown file to the semantic search index so it can
-    be found with search_documents later.
+    Add a local text or Markdown file to the semantic search index.
+    Paths are relative to the project folder, e.g. 'knowledge/meetings/standup.md'.
 
-    Paths are relative to the project folder, e.g.:
-        index_document("transcriptions/meeting.md")
-        index_document("reports/research.md")
+    doc_type (optional): "meeting", "idea", "project", "report", "improvement"
+    If omitted, the type is inferred from the file's parent folder name.
 
     Re-indexing the same file is safe — old chunks are replaced automatically.
-    Requires the Ollama nomic-embed-text model:  ollama pull nomic-embed-text
+    Requires: ollama pull nomic-embed-text
     """
     allowed = {".txt", ".md", ".py", ".json", ".csv"}
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in allowed:
+    if os.path.splitext(file_path)[1].lower() not in allowed:
         return f"Error: only {allowed} files can be indexed."
 
     abs_path = os.path.abspath(file_path)
@@ -361,46 +454,295 @@ def index_document(file_path: str) -> str:
         if os.path.exists(alt):
             abs_path = alt
         else:
-            return f"Error: file not found — tried '{file_path}' and relative to project root."
+            return f"Error: file not found — '{file_path}'"
 
-    return _index_file(abs_path)
+    return _index_file(abs_path, doc_type)
 
 
 @tool
-def search_documents(query: str) -> str:
+def search_documents(query: str, doc_type: str = "", top_k: int = 4) -> str:
     """
-    Search across all indexed documents (transcriptions, notes, reports) using
-    semantic similarity. Returns the most relevant passages with their source files.
+    Search across all indexed documents using semantic similarity.
 
-    Use this to answer questions about past meetings, saved research, or any
-    content that has been indexed with index_document.
+    query:    what you're looking for (natural language)
+    doc_type: filter by type — "meeting", "idea", "improvement", "report", "project"
+              leave empty to search across all types
+    top_k:    number of results to return (default 4)
 
-    Requires at least one document to have been indexed first.
+    Examples:
+        search_documents("action items from last week")
+        search_documents("UI friction", "improvement")
+        search_documents("project goals", "project", 6)
     """
     store, err = _get_vectorstore()
     if err:
         return f"Error: {err}"
 
     try:
-        results = store.similarity_search(query, k=4)
+        where   = {"type": {"$eq": doc_type}} if doc_type else None
+        results = store.similarity_search(query, k=int(top_k), filter=where)
     except Exception as e:
         return f"Error during search: {e}"
 
     if not results:
+        tip = f" of type '{doc_type}'" if doc_type else ""
         return (
-            "No relevant documents found. "
+            f"No relevant documents found{tip}. "
             "Use index_document to add files to the search index first."
         )
 
     parts = []
     for i, doc in enumerate(results, 1):
-        source_name = os.path.basename(doc.metadata.get("source", "unknown"))
-        parts.append(f"**[{i}] {source_name}**\n{doc.page_content}")
+        meta        = doc.metadata
+        source_name = os.path.basename(meta.get("source", "unknown"))
+        type_tag    = meta.get("type", "")
+        date_tag    = meta.get("date", "")
+        header      = f"**[{i}] {source_name}**"
+        if type_tag or date_tag:
+            header += f"  `{type_tag} · {date_tag}`"
+        parts.append(f"{header}\n{doc.page_content}")
 
     return "\n\n---\n\n".join(parts)
 
 
-# Export all tools as a list — this is what the agent will use
+# ── Structure & knowledge tools ──────────────────────────────────────────────────
+
+_TEMPLATES = {
+    "ideas": """\
+## Summary
+{summary}
+
+## Key Points
+{key_points}
+
+## Open Questions
+{open_questions}
+
+## Next Steps
+{next_steps}""",
+
+    "problem": """\
+## Problem Description
+{problem_description}
+
+## Root Causes
+{root_causes}
+
+## Impact
+{impact}
+
+## Possible Solutions
+{possible_solutions}
+
+## Recommended Next Step
+{recommended_next_step}""",
+
+    "project": """\
+## Goal
+{goal}
+
+## Tasks
+{tasks}
+
+## Dependencies
+{dependencies}
+
+## Risks
+{risks}
+
+## Next Action
+{next_action}""",
+}
+
+_TEMPLATE_FIELDS = {
+    "ideas":   ["summary", "key_points", "open_questions", "next_steps"],
+    "problem": ["problem_description", "root_causes", "impact",
+                "possible_solutions", "recommended_next_step"],
+    "project": ["goal", "tasks", "dependencies", "risks", "next_action"],
+}
+
+
+@tool
+def structure_thoughts(input_text: str, template_type: str) -> str:
+    """
+    Structure raw thoughts, ideas, or notes into a clean, consistent markdown document.
+
+    template_type must be one of:
+      "ideas"   → Summary · Key Points · Open Questions · Next Steps
+      "problem" → Problem Description · Root Causes · Impact · Possible Solutions · Recommended Next Step
+      "project" → Goal · Tasks · Dependencies · Risks · Next Action
+
+    The output is saved to knowledge/ideas/ and indexed for future retrieval.
+    Returns the structured document.
+    """
+    template_type = template_type.lower().strip()
+    if template_type not in _TEMPLATES:
+        return f"Error: template_type must be one of {list(_TEMPLATES.keys())}"
+
+    fields     = _TEMPLATE_FIELDS[template_type]
+    field_list = "\n".join(f'"{f}": "..."' for f in fields)
+
+    prompt = f"""You are a structured-thinking assistant. Fill in each field below based on the input.
+Be concise. Return ONLY a JSON object with these exact keys — no markdown, no explanation.
+
+Fields required:
+{{{field_list}}}
+
+For list-type fields (key_points, tasks, etc.), use a newline-separated string of "- item" lines.
+
+Input:
+{input_text}"""
+
+    try:
+        llm      = _get_structure_llm()
+        response = llm.invoke([_HM(content=prompt)])
+        raw      = response.content.strip()
+
+        # Extract JSON from the response (model sometimes wraps in ```json blocks)
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not json_match:
+            raise ValueError("No JSON found in response")
+        data = json.loads(json_match.group())
+
+        # Fill the template
+        filled = _TEMPLATES[template_type].format(**{k: data.get(k, "—") for k in fields})
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        full_doc  = (
+            f"# {template_type.capitalize()} – {timestamp}\n\n"
+            f"{filled}\n\n"
+            f"---\n*Source input:* {input_text[:200]}{'…' if len(input_text) > 200 else ''}\n"
+        )
+
+        # Save to knowledge/ideas/
+        stem     = datetime.now().strftime(f"{template_type}_%Y-%m-%d_%H-%M")
+        out_path = os.path.join(IDEAS_DIR, f"{stem}.md")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(full_doc)
+        _auto_index(out_path, "idea")
+
+        return f"Saved to {out_path}\n\n{full_doc}"
+
+    except Exception as e:
+        return f"Error structuring thoughts: {e}\n\nRaw model output:\n{raw if 'raw' in dir() else 'n/a'}"
+
+
+@tool
+def log_improvement(input_text: str) -> str:
+    """
+    Log a friction point, bug, or improvement idea to the improvements backlog.
+    The entry is saved to knowledge/improvements/ and indexed for analysis.
+
+    Format input_text with labelled sections for best results:
+        Problem: the search is slow with many documents
+        Context: happens when knowledge base has 50+ files
+        Impact: users wait 5+ seconds per query
+        Suggestion: add an index cache layer
+        Questions: is this a ChromaDB limit or embedding model?
+
+    Plain text also works — everything is treated as the Problem description.
+    """
+    # Parse labelled sections if present, otherwise treat all as Problem
+    sections = {"problem": "", "context": "", "impact": "", "suggestion": "", "questions": ""}
+    current  = "problem"
+    label_map = {
+        "problem:":    "problem",
+        "context:":    "context",
+        "impact:":     "impact",
+        "suggestion:": "suggestion",
+        "questions:":  "questions",
+    }
+
+    for line in input_text.strip().splitlines():
+        matched = False
+        for label, key in label_map.items():
+            if line.lower().startswith(label):
+                current = key
+                sections[current] = line[len(label):].strip()
+                matched = True
+                break
+        if not matched:
+            sep = "\n" if sections[current] else ""
+            sections[current] += sep + line
+
+    # If nothing reached the named sections, everything is in "problem" already
+    if not sections["problem"].strip():
+        sections["problem"] = input_text.strip()
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    fname     = datetime.now().strftime("improvement_%Y-%m-%d_%H-%M.md")
+    out_path  = os.path.join(IMPROVEMENTS_DIR, fname)
+
+    md = f"""\
+# Improvement – {timestamp}
+
+## Problem
+{sections['problem'] or '—'}
+
+## Context
+{sections['context'] or '—'}
+
+## Why it matters
+{sections['impact'] or '—'}
+
+## Suggested Change
+{sections['suggestion'] or '—'}
+
+## Open Questions
+{sections['questions'] or '—'}
+"""
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(md)
+    _auto_index(out_path, "improvement")
+
+    return f"Improvement logged to {out_path}"
+
+
+@tool
+def analyze_improvements() -> str:
+    """
+    Analyze all logged improvements to identify recurring themes and suggest priorities.
+    Returns a structured markdown summary.
+
+    Use this periodically once the backlog has several entries.
+    """
+    if not os.path.exists(IMPROVEMENTS_DIR):
+        return "No improvements logged yet. Use log_improvement to start building the backlog."
+
+    files = sorted(f for f in os.listdir(IMPROVEMENTS_DIR) if f.endswith(".md"))
+    if not files:
+        return "Improvements folder exists but is empty. Use log_improvement to add entries."
+
+    snippets = []
+    for fname in files[-20:]:   # cap at 20 to stay within context
+        path = os.path.join(IMPROVEMENTS_DIR, fname)
+        try:
+            with open(path, encoding="utf-8") as f:
+                snippets.append(f"### {fname}\n{f.read()}")
+        except Exception:
+            pass
+
+    combined = "\n\n---\n\n".join(snippets)
+    prompt   = f"""\
+Analyze the following improvement logs and produce a structured markdown report with:
+
+1. **Recurring Themes** — group similar issues together
+2. **Highest Impact Items** — which issues matter most and why
+3. **Suggested Priority Order** — ordered list of what to fix first
+
+Be concise. Base everything strictly on the logs provided.
+
+IMPROVEMENT LOGS:
+{combined[:6000]}"""
+
+    try:
+        llm      = _get_structure_llm()
+        response = llm.invoke([_HM(content=prompt)])
+        return response.content
+    except Exception as e:
+        return f"Error during analysis: {e}"
+
+
+# ── Export ───────────────────────────────────────────────────────────────────────
 TOOLS = [
     brave_search,
     python_repl,
@@ -413,4 +755,7 @@ TOOLS = [
     delete_memory,
     index_document,
     search_documents,
+    structure_thoughts,
+    log_improvement,
+    analyze_improvements,
 ]

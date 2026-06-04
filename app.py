@@ -21,13 +21,16 @@ from memory import load_memories, delete_memory_entry, clear_all_memories
 from tools import _index_file
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-_BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-CHATS_DIR        = os.path.join(_BASE_DIR, "chats")
-AUDIO_IN_DIR     = os.path.join(_BASE_DIR, "audio_in")
+_BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
+CHATS_DIR          = os.path.join(_BASE_DIR, "chats")
+AUDIO_IN_DIR       = os.path.join(_BASE_DIR, "audio_in")
+KNOWLEDGE_DIR      = os.path.join(_BASE_DIR, "knowledge")
+MEETINGS_DIR       = os.path.join(KNOWLEDGE_DIR, "meetings")
+# Legacy path — kept so old transcriptions/ status dots still work
 TRANSCRIPTIONS_DIR = os.path.join(_BASE_DIR, "transcriptions")
 os.makedirs(CHATS_DIR, exist_ok=True)
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".ogg", ".flac", ".webm"}
 
 
@@ -120,6 +123,29 @@ def load_chat_into_state(chat: dict) -> None:
             pass  # non-fatal — user can still view history
 
 
+def _extract_meeting_json(summary_text: str, model_name: str) -> dict:
+    """
+    Call a second low-temp LLM pass to extract structured data from a meeting summary.
+    Returns {"tasks": [...], "decisions": [...], "people": [...]} or empty lists on failure.
+    """
+    try:
+        from langchain_ollama import ChatOllama as _CO
+        import re as _re
+
+        llm  = _CO(model=model_name, temperature=0, base_url=OLLAMA_BASE_URL)
+        prompt = (
+            "Extract structured data from the meeting summary below.\n"
+            "Return ONLY valid JSON — no markdown fences, no explanation.\n\n"
+            'Format: {"tasks": ["..."], "decisions": ["..."], "people": ["..."]}\n\n'
+            f"Summary:\n{summary_text[:3000]}"
+        )
+        raw   = llm.invoke([HumanMessage(content=prompt)]).content.strip()
+        match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        return json.loads(match.group()) if match else json.loads(raw)
+    except Exception:
+        return {"tasks": [], "decisions": [], "people": []}
+
+
 # ── Page setup ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI Research Agent", page_icon="🤖", layout="wide")
 st.title("🤖 AI Research Agent")
@@ -140,6 +166,10 @@ if "saved_uploads" not in st.session_state:
     # Tracks filenames already written to audio_in/ this session to prevent
     # double-saves when Streamlit reruns with the uploader widget still populated.
     st.session_state.saved_uploads = set()
+if "show_structure_form" not in st.session_state:
+    st.session_state.show_structure_form = False
+if "show_improvement_form" not in st.session_state:
+    st.session_state.show_improvement_form = False
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -253,8 +283,15 @@ with st.sidebar:
         for af in audio_files:
             size_kb = os.path.getsize(os.path.join(AUDIO_IN_DIR, af)) // 1024
             stem = os.path.splitext(af)[0]
-            has_transcript = os.path.exists(os.path.join(TRANSCRIPTIONS_DIR, f"{stem}.md"))
-            has_summary    = os.path.exists(os.path.join(TRANSCRIPTIONS_DIR, f"{stem}_summary.md"))
+            # Check new knowledge/meetings/ first, fall back to legacy transcriptions/
+            has_transcript = (
+                os.path.exists(os.path.join(MEETINGS_DIR, f"{stem}.md")) or
+                os.path.exists(os.path.join(TRANSCRIPTIONS_DIR, f"{stem}.md"))
+            )
+            has_summary = (
+                os.path.exists(os.path.join(MEETINGS_DIR, f"{stem}_summary.md")) or
+                os.path.exists(os.path.join(TRANSCRIPTIONS_DIR, f"{stem}_summary.md"))
+            )
             # 🔴 nothing  🔵 transcript only  ✅ both done
             if has_transcript and has_summary:
                 status = "✅"
@@ -270,7 +307,8 @@ with st.sidebar:
                     # Set flag so the app saves the agent's reply automatically —
                     # avoids relying on the model to chain a second write_md_file call.
                     st.session_state.auto_save_summary = {
-                        "path": f"transcriptions/{stem}_summary.md",
+                        "path": f"knowledge/meetings/{stem}_summary.md",
+                        "json_path": f"knowledge/meetings/{stem}_data.json",
                         "stem": stem,
                     }
                     st.session_state.pending_input = (
@@ -328,15 +366,18 @@ with st.sidebar:
     _col_idx, _col_clr = st.columns(2)
     with _col_idx:
         if st.button("📚 Index docs", use_container_width=True,
-                     help="Index transcriptions/ and reports/ for semantic search"):
+                     help="Index all .md files in knowledge/ for semantic search"):
             _indexed = 0
-            for _dir in ["transcriptions", "reports"]:
-                _dp = os.path.join(_BASE_DIR, _dir)
-                if os.path.exists(_dp):
-                    for _fn in sorted(os.listdir(_dp)):
-                        if _fn.endswith(".md"):
-                            _index_file(os.path.join(_dp, _fn))
-                            _indexed += 1
+            # Walk the full knowledge/ tree + legacy dirs
+            for _scan in [KNOWLEDGE_DIR,
+                          os.path.join(_BASE_DIR, "transcriptions"),
+                          os.path.join(_BASE_DIR, "reports")]:
+                if os.path.exists(_scan):
+                    for _root, _, _files in os.walk(_scan):
+                        for _fn in _files:
+                            if _fn.endswith(".md"):
+                                _index_file(os.path.join(_root, _fn))
+                                _indexed += 1
             st.success(f"Indexed {_indexed} file(s)")
     with _col_clr:
         if st.button("🗑 Clear all", use_container_width=True,
@@ -344,6 +385,84 @@ with st.sidebar:
             n = clear_all_memories()
             st.success(f"Cleared {n} memory/memories")
             st.rerun()
+
+    st.divider()
+
+    # --- Knowledge actions ---
+    st.header("🗄️ Knowledge")
+
+    # Structure this
+    if st.button("💡 Structure this", use_container_width=True,
+                 help="Structure notes or ideas into a clean template"):
+        st.session_state.show_structure_form = not st.session_state.show_structure_form
+        st.session_state.show_improvement_form = False
+
+    if st.session_state.show_structure_form:
+        with st.form("structure_form", clear_on_submit=True):
+            _struct_text = st.text_area("Paste your notes or ideas", height=100)
+            _struct_type = st.selectbox("Template", ["ideas", "problem", "project"])
+            if st.form_submit_button("Structure it ➜"):
+                if _struct_text.strip():
+                    st.session_state.pending_input = (
+                        f'Structure the following as a "{_struct_type}" using the '
+                        f'structure_thoughts tool:\n\n{_struct_text}'
+                    )
+                    st.session_state.show_structure_form = False
+                    st.rerun()
+
+    # Save last reply to knowledge base
+    if st.button("💾 Save to knowledge", use_container_width=True,
+                 help="Save the last agent reply to knowledge/ideas/"):
+        _last = next(
+            (m for m in reversed(st.session_state.display_messages)
+             if m["role"] == "assistant"), None
+        )
+        if _last:
+            _stem = datetime.now().strftime("idea_%Y-%m-%d_%H-%M")
+            _kpath = os.path.join(KNOWLEDGE_DIR, "ideas", f"{_stem}.md")
+            os.makedirs(os.path.dirname(_kpath), exist_ok=True)
+            with open(_kpath, "w", encoding="utf-8") as _kf:
+                _kf.write(
+                    f"# Idea – {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"{_last['content']}\n"
+                )
+            _index_file(_kpath, "idea")
+            st.success(f"Saved & indexed → `knowledge/ideas/{_stem}.md`")
+        else:
+            st.warning("No assistant reply to save yet.")
+
+    # Log improvement
+    if st.button("🐛 Log improvement", use_container_width=True,
+                 help="Capture a friction point or bug to the improvements backlog"):
+        st.session_state.show_improvement_form = not st.session_state.show_improvement_form
+        st.session_state.show_structure_form = False
+
+    if st.session_state.show_improvement_form:
+        with st.form("improvement_form", clear_on_submit=True):
+            _imp_text = st.text_area(
+                "Describe the issue",
+                height=100,
+                placeholder="Problem: ...\nContext: ...\nImpact: ...",
+            )
+            if st.form_submit_button("Log it ➜"):
+                if _imp_text.strip():
+                    st.session_state.pending_input = (
+                        f"Log the following improvement using the log_improvement tool:\n\n"
+                        f"{_imp_text}"
+                    )
+                    st.session_state.show_improvement_form = False
+                    st.rerun()
+
+    # Index all knowledge
+    if st.button("📚 Index knowledge", use_container_width=True,
+                 help="Walk knowledge/ and index every .md file"):
+        _cnt = 0
+        for _root, _, _files in os.walk(KNOWLEDGE_DIR):
+            for _fn in _files:
+                if _fn.endswith(".md"):
+                    _index_file(os.path.join(_root, _fn))
+                    _cnt += 1
+        st.success(f"Indexed {_cnt} file(s) from knowledge/")
 
     st.divider()
 
@@ -363,7 +482,7 @@ with st.sidebar:
 # ── Caption ────────────────────────────────────────────────────────────────────
 st.caption(
     f"Model: `{st.session_state.selected_model}` · "
-    "Tools: Brave Search · Python REPL · Browse Dir · Read File · Write MD · Transcribe Audio · Memory · RAG"
+    "Tools: Search · REPL · Files · Transcribe · Memory · RAG · Structure · Improvements"
 )
 
 # ── Chat display ───────────────────────────────────────────────────────────────
@@ -439,13 +558,13 @@ if user_input:
         "tools_used": list(set(tools_used)),
     })
 
-    # ── Auto-save meeting summary ──────────────────────────────────────────────
+    # ── Auto-save meeting summary + structured JSON extraction ────────────────
     # The model reliably transcribes but sometimes skips the write_md_file call.
-    # When the transcription button was used, we save the reply ourselves instead
-    # of depending on the model to chain a second tool call.
+    # When the transcription button was used, we save everything ourselves instead
+    # of depending on the model to chain multiple tool calls.
     if "auto_save_summary" in st.session_state:
         if "transcribe_audio" in tools_used:
-            save_info = st.session_state.pop("auto_save_summary")
+            save_info    = st.session_state.pop("auto_save_summary")
             summary_path = os.path.join(_BASE_DIR, save_info["path"])
             os.makedirs(os.path.dirname(summary_path), exist_ok=True)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -456,9 +575,26 @@ if user_input:
             )
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write(md_content)
-            st.success(f"💾 Summary saved to `{save_info['path']}`")
+
+            # Index the summary for semantic search
+            _index_file(summary_path, "meeting")
+
+            # Extract structured JSON (tasks / decisions / people)
+            with st.spinner("Extracting structured data…"):
+                meeting_data = _extract_meeting_json(
+                    reply, st.session_state.selected_model
+                )
+            json_path = os.path.join(_BASE_DIR, save_info["json_path"])
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(meeting_data, f, indent=2, ensure_ascii=False)
+
+            n_tasks = len(meeting_data.get("tasks", []))
+            st.success(
+                f"💾 Summary → `{save_info['path']}`  \n"
+                f"📋 Extracted {n_tasks} task(s) → `{save_info['json_path']}`"
+            )
         else:
-            # Transcription wasn't called (model may have answered from memory),
+            # Transcription wasn't called (model may have answered from memory);
             # clear the flag so it doesn't fire on the next unrelated message.
             del st.session_state["auto_save_summary"]
 
