@@ -51,4 +51,6 @@ Thumbs.db
 .pytest_cache/
 
 todo/*.md
-notes
+notesnotes
+DEVLOG.md
+
