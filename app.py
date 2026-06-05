@@ -489,7 +489,7 @@ st.caption(
 for msg in st.session_state.display_messages:
     with st.chat_message(msg["role"]):
         if msg.get("image_b64"):
-            st.image(base64.b64decode(msg["image_b64"]), use_container_width=True)
+            st.image(base64.b64decode(msg["image_b64"]), width="stretch")
         st.markdown(msg["content"])
         if msg.get("tools_used"):
             st.caption(f"🔧 Tools used: {', '.join(msg['tools_used'])}")
@@ -503,6 +503,38 @@ attached_image = st.file_uploader(
     key="chat_image_upload",
     label_visibility="collapsed",
 )
+_vision_model = os.environ.get("VISION_MODEL", "gemma3:4b")
+st.caption(
+    f"📎 Attach an image — image turns are answered by the vision model "
+    f"`{_vision_model}` (tools disabled for that turn)."
+)
+
+# ── Image queue ────────────────────────────────────────────────────────────────
+# st.file_uploader can return None on the rerun triggered by st.chat_input
+# (Streamlit flushes widget state in a different order than script execution).
+# Fix: copy bytes into session_state on the upload rerun so they survive into
+# the chat_input submit rerun.
+if attached_image is not None:
+    _uid = f"{attached_image.name}_{attached_image.size}"
+    if st.session_state.get("_queued_img_id") != _uid:
+        st.session_state["_queued_img"] = {
+            "b64": base64.b64encode(attached_image.getvalue()).decode(),
+            "mime": attached_image.type or "image/png",
+            "name": attached_image.name,
+        }
+        st.session_state["_queued_img_id"] = _uid
+
+# If the uploader was cleared but an image is still queued, show indicator + cancel
+if "_queued_img" in st.session_state and attached_image is None:
+    _qprev = st.session_state["_queued_img"]
+    _ci1, _ci2 = st.columns([9, 1])
+    with _ci1:
+        st.caption(f"📎 Image queued: `{_qprev['name']}`")
+    with _ci2:
+        if st.button("✕", key="clear_queued_img", help="Remove attached image"):
+            st.session_state.pop("_queued_img", None)
+            st.session_state.pop("_queued_img_id", None)
+            st.rerun()
 
 user_input = st.chat_input("Ask me anything...")
 if hasattr(st.session_state, "pending_input"):
@@ -510,11 +542,14 @@ if hasattr(st.session_state, "pending_input"):
     del st.session_state.pending_input
 
 if user_input:
+    # Consume any queued image (session_state copy is reliable; widget value is not)
+    _qimg = st.session_state.pop("_queued_img", None)
+    st.session_state.pop("_queued_img_id", None)
+
     # Build LangChain message — multimodal when an image is attached
-    if attached_image is not None:
-        img_bytes = attached_image.getvalue()
-        img_b64   = base64.b64encode(img_bytes).decode()
-        mime      = attached_image.type or "image/png"
+    if _qimg:
+        img_b64  = _qimg["b64"]
+        mime     = _qimg["mime"]
         lc_content = [
             {"type": "text", "text": user_input},
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
@@ -528,8 +563,8 @@ if user_input:
     # Show user message immediately
     st.session_state.display_messages.append(user_display)
     with st.chat_message("user"):
-        if attached_image is not None:
-            st.image(attached_image, use_container_width=True)
+        if _qimg:
+            st.image(base64.b64decode(img_b64), width="stretch")
         st.markdown(user_input)
 
     # Run agent

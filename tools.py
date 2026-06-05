@@ -78,7 +78,16 @@ _brave = BraveSearchWrapper(
 @tool
 def brave_search(query: str) -> str:
     """Search the web for current information. Use this for recent events, facts, or anything you're unsure about."""
-    return _brave.run(query)
+    # Degrade gracefully (like every other tool) instead of crashing the agent
+    # when the API key is missing or the request fails.
+    if not os.environ.get("BRAVE_SEARCH_API_KEY", "").strip():
+        return ("Error: web search is unavailable because BRAVE_SEARCH_API_KEY is not set. "
+                "Answer from your own knowledge instead.")
+    try:
+        return _brave.run(query)
+    except Exception as e:
+        return (f"Error: web search failed ({e}). "
+                "Answer from your own knowledge instead.")
 
 
 # ── Python REPL (sandboxed to workspace/) ───────────────────────────────────────

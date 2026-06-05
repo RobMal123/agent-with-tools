@@ -179,3 +179,108 @@ Extended the agent with **persistent long-term memory**, **semantic document sea
 | Embeddings | Ollama `nomic-embed-text` |
 | UI | Streamlit |
 | API | FastAPI |
+
+---
+
+# Dev Log — 2026-06-05
+
+## What we did today
+
+Tracked down why image input "didn't work," discovered the model was the problem
+(not the code), added a **dedicated vision-model route**, and rewrote the test suite
+into **real, discriminating LLM tests** — which immediately surfaced a real crash bug.
+
+---
+
+## Session summary
+
+### 1. Diagnosed broken image input → the model was blind
+
+- Symptom: attach an image, ask about it, model replies *"you didn't send an image."*
+  LangSmith confirmed the image **was** reaching the model in the request.
+- False trail #1: `st.file_uploader` returning `None` on the `st.chat_input` rerun.
+  Real timing bug — fixed by stashing image bytes in `st.session_state["_queued_img"]`
+  and consuming them on submit — but **not** the root cause.
+- False trail #2: my own verification was worthless. A 1×1-pixel "what colour is this?"
+  test let the model **guess** a colour and look like it passed. The moment I switched to
+  a **discriminating** test (solid red/green/blue + read a number), the truth appeared.
+- Root cause: the custom **`gemma4`** model advertises a `vision` capability that does
+  **not actually work** in Ollama. Proof — via the raw Ollama API *and* Ollama's own
+  native chat UI (zero app code): red/green/blue all returned "Black", number images
+  returned "I cannot see an image." No app-side change could fix a blind model.
+
+### 2. Fixed vision via a dedicated vision-model route
+
+- Pulled **`gemma3:4b`** (official Gemma 3, real working vision). Verified with the same
+  discriminating test: Red→"Red", Green→"Green", Blue→"Blue", and it reads digits.
+- `build_agent(model_name, use_memory=True, vision_model=None)` — new `vision_model` arg,
+  defaults to `VISION_MODEL` env or `gemma3:4b`.
+- `call_model` now detects an `image_url` part in the latest human message and routes that
+  turn to the vision LLM with a short new `VISION_SYSTEM_PROMPT` and **no tools**
+  (gemma3 rejects tools — confirmed; tools also break Ollama vision). Text turns are
+  unchanged: primary model + full system prompt + all tools.
+- The two models swap in/out of VRAM as you alternate image/text turns (a few seconds'
+  load latency — normal). End-to-end verified: image of "5" → agent replied "5".
+- `app.py`: caption naming the active vision model; `st.image(... use_container_width=True)`
+  → `width="stretch"` to clear a Streamlit deprecation warning.
+- `.env.example` documents `VISION_MODEL=gemma3:4b`.
+
+### 3. Rewrote `test_agent.py` into real, discriminating tests (no mocks)
+
+- Removed the mocked LLM test. Every LLM test now makes a **real Ollama call** and asserts
+  on an outcome **impossible to fake if the machinery is broken**:
+  - **tool calling** → `83621 * 7919 = 662194699` (no small model does this without the REPL)
+  - **vision** → reads digits 3/5/8 and names red/green/blue (the permanent regression guard
+    for this whole saga — a blind model answering "Black" to everything fails it)
+  - **memory** → recalls the unguessable codeword `platypus-9271`
+  - **RAG** → retrieves a unique invented fact (`4471 kelvin`)
+- Tests `skipif` Ollama is down or a model isn't pulled. Fixtures isolate side effects:
+  `preserve_memory` snapshots/restores `memory.json`; `temp_vectorstore` points ChromaDB at
+  a throwaway dir. (Isolation, not mocking — real LLM/embeddings/vector search still run.)
+- Requires: `ollama pull llama3.2 gemma3:4b nomic-embed-text`.
+
+### 4. Real bug the tests surfaced: `brave_search` crashed the agent
+
+- With no `BRAVE_SEARCH_API_KEY`, `brave_search` **raised** (HTTP 422) instead of returning
+  a graceful `Error: …` string like every other tool — taking down the entire agent run
+  whenever the model decided to search.
+- Fixed to degrade gracefully: returns an error string telling the model to answer from its
+  own knowledge. Never raises.
+
+### 5. Fixed `pytest test_agent.py` import failure
+
+- Bare `pytest test_agent.py` failed with `ModuleNotFoundError: graph`, caused by a vestigial
+  `__init__.py` (present since the initial commit, imported by nothing) that flipped pytest
+  into package-import mode and kept `files/` off `sys.path`.
+- Removed `__init__.py`; added `conftest.py` that prepends `files/` to `sys.path` (the same
+  thing `app.py`/`main.py` do at runtime). Verified with the **exact** bare `pytest` command,
+  not just `python -m pytest` (they differ in `sys.path` handling).
+
+### 6. Brought `CLAUDE.md` up to date
+
+- Comprehensive rewrite covering long-term memory, RAG, the vision-routing model, the full
+  env-var table, the real-LLM testing philosophy, and the "never add an `__init__.py` to
+  `files/`" rule.
+
+---
+
+## Process lesson (worth keeping)
+
+> A verification that can't produce a *wrong* answer when the system is broken isn't a
+> verification.
+
+The 1×1-pixel "what colour" check passed against a totally blind model. Switching to
+discriminating inputs (three distinct colours + a number to read) exposed the truth in one
+shot — and the same principle now guards the suite permanently. Also: **test the exact
+command the user runs** (`pytest …`, not `python -m pytest …`).
+
+---
+
+## Stack changes
+
+| Component | Change |
+|-----------|--------|
+| Vision | New dedicated route → Ollama `gemma3:4b` (`VISION_MODEL`) for image turns |
+| Primary LLM | Unchanged for text/tools (`llama3.2`); `gemma4` retired for vision (broken) |
+| Tests | Real-LLM discriminating tests; `conftest.py` added; `__init__.py` removed |
+| Web search | `brave_search` degrades gracefully instead of crashing the agent |
