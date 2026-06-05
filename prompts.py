@@ -59,3 +59,15 @@ knowledge/
 - Keep answers concise unless detail is requested
 - Code blocks with language tags for all code
 """
+
+
+# Short prompt used ONLY for image turns, which are routed to a dedicated vision
+# model (e.g. gemma3:4b).  That model does not have tools, so the long tool-centric
+# SYSTEM_PROMPT above is irrelevant — and a long prompt can also distract small
+# vision models from the image.  Keep this minimal and image-focused.
+VISION_SYSTEM_PROMPT = (
+    "You are a helpful assistant with vision capabilities. "
+    "Carefully examine any image the user provides and answer their question "
+    "about it directly and accurately. If text or numbers appear in the image, "
+    "read them precisely."
+)

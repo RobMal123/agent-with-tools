@@ -1,15 +1,181 @@
 """
-tests/test_agent.py
+test_agent.py — real, discriminating tests (NO mocks of the LLM).
 
-Run with: pytest test_agent.py -v
+Run with:   pytest test_agent.py -v
+Single test: pytest test_agent.py::test_vision_reads_numbers -v
+
+Design principle (learned the hard way):
+    A verification that cannot produce a WRONG answer when the system is broken
+    is not a verification. Every LLM test below asserts on an outcome that is
+    impossible to produce unless the real machinery actually works:
+        - tool calling  -> a 9-digit product no small model can do in its head
+        - vision        -> reading specific digits / naming specific colors
+        - memory        -> recalling an unguessable codeword
+        - RAG           -> retrieving a unique fact only present in the indexed doc
+
+These hit a live Ollama instance and are slower than unit tests. They SKIP
+cleanly (not fail) when Ollama isn't running or a required model isn't pulled.
+
+Required models (skipped individually if missing):
+    TEST_MODEL          (default: llama3.2)        — reasoning + tool calls
+    TEST_VISION_MODEL   (default: gemma3:4b)       — image turns
+    EMBED_MODEL         (default: nomic-embed-text)— RAG embeddings
 """
 
+import os
+import re
+import io
+import uuid
+import base64
+
 import pytest
-from unittest.mock import patch, MagicMock
+import requests
 from langchain_core.messages import HumanMessage, AIMessage
 
 
-# --- Tool tests ---
+# ── Environment / availability ──────────────────────────────────────────────────
+
+OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+TEST_MODEL       = os.environ.get("TEST_MODEL", "llama3.2")
+TEST_VISION_MODEL = os.environ.get("TEST_VISION_MODEL", "gemma3:4b")
+EMBED_MODEL      = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+
+
+def _fetch_installed():
+    """Return list of installed Ollama model names, or None if Ollama is down."""
+    try:
+        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return None
+
+
+_INSTALLED = _fetch_installed()
+
+
+def _has_model(model: str) -> bool:
+    """True if `model` is pulled. An untagged spec matches any tag (e.g. :latest)."""
+    if not _INSTALLED:
+        return False
+    if model in _INSTALLED:
+        return True
+    if ":" not in model:                       # "llama3.2" matches "llama3.2:latest"
+        return any(name.split(":")[0] == model for name in _INSTALLED)
+    return False
+
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
+
+
+# Skip decorators -----------------------------------------------------------------
+requires_ollama = pytest.mark.skipif(
+    _INSTALLED is None, reason=f"Ollama not reachable at {OLLAMA_BASE_URL}"
+)
+requires_text = pytest.mark.skipif(
+    not _has_model(TEST_MODEL), reason=f"model '{TEST_MODEL}' not pulled"
+)
+requires_vision = pytest.mark.skipif(
+    not _has_model(TEST_VISION_MODEL), reason=f"vision model '{TEST_VISION_MODEL}' not pulled"
+)
+requires_embed = pytest.mark.skipif(
+    not _has_model(EMBED_MODEL), reason=f"embed model '{EMBED_MODEL}' not pulled"
+)
+requires_pil = pytest.mark.skipif(not _HAS_PIL, reason="Pillow not installed")
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────────
+
+def _digits(text: str) -> str:
+    """All digits in `text`, concatenated — for matching numbers ignoring commas/spaces."""
+    return re.sub(r"\D", "", text)
+
+
+def _tools_used(result: dict) -> list:
+    """Names of every tool the agent actually called during a run."""
+    used = []
+    for m in result["messages"]:
+        for tc in getattr(m, "tool_calls", None) or []:
+            used.append(tc["name"])
+    return used
+
+
+def _png_b64(im) -> str:
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _solid(color, size=200):
+    return Image.new("RGB", (size, size), color)
+
+
+def _number_img(n, size=200):
+    im = Image.new("RGB", (size, size), "white")
+    d = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 150)
+    except Exception:
+        font = ImageFont.load_default()
+    d.text((size // 2, size // 2), str(n), fill="black", anchor="mm", font=font)
+    return im
+
+
+def _ask(agent, text, image=None):
+    """Single-turn invoke on a fresh thread. Optionally attach a PIL image."""
+    if image is not None:
+        content = [
+            {"type": "text", "text": text},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{_png_b64(image)}"}},
+        ]
+        msg = HumanMessage(content=content)
+    else:
+        msg = HumanMessage(content=text)
+    cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    result = agent.invoke({"messages": [msg]}, config=cfg)
+    return result, result["messages"][-1].content
+
+
+# ── Fixtures (isolation — NOT mocking; the real systems still run) ───────────────
+
+@pytest.fixture
+def preserve_memory():
+    """Snapshot memory.json and restore it after the test so we don't clobber real data."""
+    import memory
+    existed = os.path.exists(memory.MEMORY_FILE)
+    backup = None
+    if existed:
+        with open(memory.MEMORY_FILE, encoding="utf-8") as f:
+            backup = f.read()
+    yield
+    if backup is not None:
+        with open(memory.MEMORY_FILE, "w", encoding="utf-8") as f:
+            f.write(backup)
+    elif os.path.exists(memory.MEMORY_FILE):
+        os.remove(memory.MEMORY_FILE)
+
+
+@pytest.fixture
+def temp_vectorstore(tmp_path):
+    """Point ChromaDB at a throwaway dir so RAG tests don't pollute the real index."""
+    import tools
+    old_dir   = tools._CHROMA_DIR
+    old_cache = dict(tools._vectorstore_cache)
+    tools._CHROMA_DIR = str(tmp_path / "chroma_test")
+    tools._vectorstore_cache.clear()
+    yield
+    tools._vectorstore_cache.clear()
+    tools._vectorstore_cache.update(old_cache)
+    tools._CHROMA_DIR = old_dir
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Pure unit tests (no LLM, no network) — fast
+# ════════════════════════════════════════════════════════════════════════════════
 
 def test_read_file_success(tmp_path):
     """File reader should return file contents."""
@@ -45,8 +211,6 @@ def test_read_file_truncates_large_files(tmp_path):
     assert "truncated" in result
 
 
-# --- Graph structure test ---
-
 def test_agent_graph_compiles():
     """The agent graph should compile without errors."""
     from graph import build_agent
@@ -61,23 +225,138 @@ def test_agent_state_schema():
     assert len(state["messages"]) == 1
 
 
-# --- Integration test (mocked LLM) ---
+# ════════════════════════════════════════════════════════════════════════════════
+#  Real LLM integration tests — discriminating, no mocks
+# ════════════════════════════════════════════════════════════════════════════════
 
-def test_agent_single_turn_no_tools():
-    """Agent should return a plain response when no tools are needed."""
+@requires_ollama
+@requires_text
+def test_llm_answers_directly_without_tools():
+    """
+    Smoke: the model gives a correct, specific answer from its own knowledge.
+    Deliberately uses a non-'current-events' question plus an explicit no-tools
+    instruction, so the answer does NOT depend on web search (which needs a
+    Brave API key the test env may not have).
+    """
+    from graph import build_agent
+    agent = build_agent(model_name=TEST_MODEL, use_memory=True)
+    _, reply = _ask(
+        agent,
+        "Answer from your own knowledge. Do NOT use any tools. "
+        "What color do you get when you mix blue and yellow paint? Reply with one word.",
+    )
+    assert "green" in reply.lower(), f"expected 'green', got: {reply!r}"
+
+
+@requires_ollama
+@requires_text
+def test_tool_calling_does_real_math():
+    """
+    DISCRIMINATING: ask for 83621 * 7919 = 662194699.
+    A small model cannot produce this 9-digit product without actually running
+    the python_repl tool — so a correct answer proves the tool path works.
+    """
+    from graph import build_agent
+    agent = build_agent(model_name=TEST_MODEL, use_memory=True)
+    result, reply = _ask(
+        agent,
+        "Use the python_repl tool to calculate 83621 * 7919. "
+        "Report the exact integer result.",
+    )
+    assert "662194699" in _digits(reply), (
+        f"expected 662194699 in answer; tools_used={_tools_used(result)}; reply={reply!r}"
+    )
+
+
+@requires_ollama
+@requires_vision
+@requires_pil
+def test_vision_reads_numbers():
+    """
+    DISCRIMINATING (the regression test for the whole vision saga):
+    the agent must READ specific digits from images. Faking three is 1/1000.
+    Image turns are routed to the dedicated vision model inside build_agent.
+    """
+    from graph import build_agent
+    agent = build_agent(
+        model_name=TEST_MODEL, use_memory=True, vision_model=TEST_VISION_MODEL
+    )
+    for n in (3, 5, 8):
+        _, reply = _ask(
+            agent,
+            "What single digit is shown in this image? Reply with just the digit.",
+            image=_number_img(n),
+        )
+        assert str(n) in reply, f"image showed {n} but model replied: {reply!r}"
+
+
+@requires_ollama
+@requires_vision
+@requires_pil
+def test_vision_distinguishes_colors():
+    """
+    DISCRIMINATING: name the dominant color for red, green AND blue.
+    A blind model answering 'Black' to everything (the original bug) fails this.
+    """
+    from graph import build_agent
+    agent = build_agent(
+        model_name=TEST_MODEL, use_memory=True, vision_model=TEST_VISION_MODEL
+    )
+    for color in ("red", "green", "blue"):
+        _, reply = _ask(
+            agent,
+            "What is the single dominant color of this image? Answer with one word.",
+            image=_solid(color),
+        )
+        assert color in reply.lower(), f"image was {color} but model replied: {reply!r}"
+
+
+@requires_ollama
+@requires_text
+def test_memory_recall(preserve_memory):
+    """
+    DISCRIMINATING: store an unguessable codeword, then confirm the agent recalls
+    it. The codeword can only appear if memory injection actually works.
+    """
+    from memory import save_memory_entry
     from graph import build_agent
 
-    app = build_agent(use_memory=False)
+    codeword = "platypus-9271"
+    save_memory_entry("secret_codeword", codeword)
 
-    plain_response = AIMessage(content="Paris is the capital of France.")
+    agent = build_agent(model_name=TEST_MODEL, use_memory=True)
+    _, reply = _ask(
+        agent,
+        "What is my secret codeword? It is stored in your long-term memory.",
+    )
+    assert codeword in reply.lower(), f"expected '{codeword}' in reply; got: {reply!r}"
 
-    with patch("langchain_ollama.ChatOllama.bind_tools") as mock_bind:
-        mock_llm = MagicMock()
-        mock_llm.invoke.return_value = plain_response
-        mock_bind.return_value = mock_llm
 
-        app2 = build_agent(use_memory=False)
-        assert app2 is not None
+@requires_ollama
+@requires_embed
+def test_rag_index_and_retrieve(temp_vectorstore, tmp_path):
+    """
+    DISCRIMINATING: index a document containing a unique invented fact, then
+    retrieve it by semantic query. The number can only come back if real
+    embeddings + vector search work end to end.
+    """
+    from tools import _index_file, search_documents
+
+    doc = tmp_path / "zultrax_report.md"
+    doc.write_text(
+        "# Zultrax-9 Reactor Notes\n\n"
+        "The Zultrax-9 reactor reaches critical resonance at exactly 4471 kelvin.\n"
+        "Below that threshold the core remains stable.\n",
+        encoding="utf-8",
+    )
+
+    status = _index_file(str(doc), "report")
+    assert "Indexed" in status, f"indexing failed: {status}"
+
+    result = search_documents.invoke(
+        {"query": "At what temperature does the Zultrax reactor reach critical resonance?"}
+    )
+    assert "4471" in result, f"unique fact not retrieved; search returned: {result!r}"
 
 
 if __name__ == "__main__":
