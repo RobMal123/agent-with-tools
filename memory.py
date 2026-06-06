@@ -3,7 +3,7 @@ memory.py — Long-term memory helpers for the agent.
 
 Facts are stored as a flat JSON dict in memory.json (project root).
 This module is imported by:
-  - tools.py   (save_memory / list_memories / delete_memory tools)
+  - tools.py   (save_memory / list_memories tools)
   - graph.py   (format_memories_for_prompt — injected into every system message)
   - app.py     (sidebar display + per-key delete)
 """
@@ -71,4 +71,9 @@ def format_memories_for_prompt() -> str:
     if not memories:
         return ""
     lines = [f"- {k}: {v}" for k, v in memories.items()]
-    return "## What you remember about the user\n" + "\n".join(lines)
+    return (
+        "## What you remember about the user\n"
+        "(These facts are already known to you — answer any recall question directly from them. "
+        "Do NOT call a tool to read or list a fact you can already see here.)\n"
+        + "\n".join(lines)
+    )

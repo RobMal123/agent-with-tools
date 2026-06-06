@@ -11,6 +11,8 @@ build/
 
 # ── Secrets ────────────────────────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
 
 # ── Generated / personal data  (directories kept via .gitkeep) ────────────────
 chats/*.json
@@ -51,6 +53,8 @@ Thumbs.db
 .pytest_cache/
 
 todo/*.md
-notesnotes
+notes
 DEVLOG.md
 
+AGENTS.md
+README.md
