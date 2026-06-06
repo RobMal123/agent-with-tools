@@ -16,7 +16,7 @@ from langchain_experimental.tools import PythonREPLTool
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage as _HM
 
-from memory import load_memories, save_memory_entry, delete_memory_entry
+from memory import load_memories, save_memory_entry
 
 
 # ── Paths ───────────────────────────────────────────────────────────────────────
@@ -37,6 +37,22 @@ TRANSCRIPTIONS_DIR = os.path.join(_BASE_DIR, "transcriptions")
 for _d in (MEETINGS_DIR, IDEAS_DIR, PROJECTS_DIR, REPORTS_DIR,
            IMPROVEMENTS_DIR, WORKSPACE_DIR):
     os.makedirs(_d, exist_ok=True)
+
+
+def _resolve_in_base(path: str) -> str | None:
+    """
+    Resolve an agent-supplied path against the project directory and confine it
+    there. Relative paths are taken relative to the project root; absolute paths
+    are allowed only if they fall inside it. Returns the real absolute path, or
+    None if it would escape _BASE_DIR (symlinks are resolved first).
+    """
+    candidate = path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
+    real = os.path.realpath(candidate)
+    base = os.path.realpath(_BASE_DIR)
+    real_nc, base_nc = os.path.normcase(real), os.path.normcase(base)
+    if real_nc == base_nc or real_nc.startswith(base_nc + os.sep):
+        return real
+    return None
 
 
 # ── Agent model tracking ────────────────────────────────────────────────────────
@@ -90,20 +106,35 @@ def brave_search(query: str) -> str:
                 "Answer from your own knowledge instead.")
 
 
-# ── Python REPL (sandboxed to workspace/) ───────────────────────────────────────
-# The working directory is pinned to workspace/ so generated files stay contained.
-# Python state (variables, imports) persists across calls in the same session.
+# ── Python REPL (DISABLED by default) ────────────────────────────────────────────
+# WARNING: this executes arbitrary Python IN-PROCESS via exec(). The os.chdir below
+# only sets the working directory to workspace/ for convenience — it is NOT a security
+# sandbox: the code can read/write any file, spawn processes, and reach the network as
+# this server's user. Because a poisoned web/search/file result can steer the agent
+# here (prompt injection → RCE), it is OFF unless you explicitly opt in by setting
+# ENABLE_CODE_EXECUTION=true — and only do that in a trusted, local-only setup.
 
 _repl_instance = PythonREPLTool()
+
+
+def _code_execution_enabled() -> bool:
+    return os.environ.get("ENABLE_CODE_EXECUTION", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @tool
 def python_repl(code: str) -> str:
     """
     Write and execute Python code for calculations, data analysis, or file generation.
-    Working directory is sandboxed to workspace/ — files written to disk appear there.
+    Working directory is set to workspace/ — files written to disk appear there.
     State (variables, imports) persists across calls within the same session.
+
+    Disabled by default for safety; returns an error unless code execution is enabled.
     """
+    if not _code_execution_enabled():
+        return ("Error: code execution is disabled. python_repl runs code in-process with no "
+                "sandbox, so it is off by default. To enable it, set ENABLE_CODE_EXECUTION=true "
+                "in the environment (trusted local-only setups only). For now, compute the answer "
+                "yourself or use another tool.")
     sandboxed = (
         f"import os; os.makedirs({repr(WORKSPACE_DIR)}, exist_ok=True); "
         f"os.chdir({repr(WORKSPACE_DIR)})\n{code}"
@@ -126,11 +157,15 @@ def read_file(file_path: str) -> str:
     if ext not in allowed_extensions:
         return f"Error: Only {allowed_extensions} files are supported."
 
-    if not os.path.exists(file_path):
+    abs_path = _resolve_in_base(file_path)
+    if abs_path is None:
+        return "Error: access denied — path is outside the project directory."
+
+    if not os.path.exists(abs_path):
         return f"Error: File not found at '{file_path}'."
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(abs_path, "r", encoding="utf-8") as f:
             content = f.read()
         if len(content) > 8000:
             return content[:8000] + "\n\n[...file truncated at 8000 characters]"
@@ -150,7 +185,9 @@ def write_md_file(file_path: str, content: str) -> str:
     if not file_path.endswith(".md"):
         return "Error: file_path must end with .md"
 
-    abs_path = os.path.abspath(file_path)
+    abs_path = _resolve_in_base(file_path)
+    if abs_path is None:
+        return "Error: access denied — path is outside the project directory."
     parent   = os.path.dirname(abs_path)
 
     try:
@@ -173,8 +210,9 @@ def list_directory(path: str = ".") -> str:
     Paths are relative to the project folder, e.g. "knowledge/meetings", "knowledge/improvements".
     Returns each entry with its type (file/dir), size in KB, and last-modified date.
     """
-    target = os.path.join(_BASE_DIR, path) if not os.path.isabs(path) else path
-    target = os.path.normpath(target)
+    target = _resolve_in_base(path)
+    if target is None:
+        return "Error: access denied — path is outside the project directory."
 
     if not os.path.exists(target):
         return f"Error: path not found — '{target}'"
@@ -239,13 +277,11 @@ def transcribe_audio(file_path: str) -> str:
     if ext not in supported:
         return f"Error: unsupported format '{ext}'. Supported: {', '.join(sorted(supported))}"
 
-    abs_path = os.path.abspath(file_path)
+    abs_path = _resolve_in_base(file_path)
+    if abs_path is None:
+        return "Error: access denied — path is outside the project directory."
     if not os.path.exists(abs_path):
-        alt = os.path.join(_BASE_DIR, file_path)
-        if os.path.exists(alt):
-            abs_path = alt
-        else:
-            return f"Error: file not found — tried '{abs_path}' and '{alt}'"
+        return f"Error: file not found — '{file_path}'"
 
     model, err = _get_whisper_model()
     if err:
@@ -315,16 +351,10 @@ def list_memories() -> str:
     return "**Long-term memories:**\n" + "\n".join(lines)
 
 
-@tool
-def delete_memory(key: str) -> str:
-    """
-    Delete a specific fact from long-term memory by its key.
-    Use list_memories first to see which keys exist.
-    """
-    removed = delete_memory_entry(key)
-    if removed:
-        return f"Deleted memory: '{key}'"
-    return f"No memory found with key '{key}'. Use list_memories to see available keys."
+# delete_memory is intentionally NOT an agent tool. Deletion is destructive, and small
+# models reflexively call it to "answer" recall questions ("what is my…?"), wiping data.
+# Memory deletion is available to the user via the UI / API (DELETE /api/memory/{key}),
+# which calls memory.delete_memory_entry directly.
 
 
 # ── Semantic search (RAG) ────────────────────────────────────────────────────────
@@ -457,13 +487,11 @@ def index_document(file_path: str, doc_type: str = "") -> str:
     if os.path.splitext(file_path)[1].lower() not in allowed:
         return f"Error: only {allowed} files can be indexed."
 
-    abs_path = os.path.abspath(file_path)
+    abs_path = _resolve_in_base(file_path)
+    if abs_path is None:
+        return "Error: access denied — path is outside the project directory."
     if not os.path.exists(abs_path):
-        alt = os.path.join(_BASE_DIR, file_path)
-        if os.path.exists(alt):
-            abs_path = alt
-        else:
-            return f"Error: file not found — '{file_path}'"
+        return f"Error: file not found — '{file_path}'"
 
     return _index_file(abs_path, doc_type)
 
@@ -761,7 +789,6 @@ TOOLS = [
     transcribe_audio,
     save_memory,
     list_memories,
-    delete_memory,
     index_document,
     search_documents,
     structure_thoughts,

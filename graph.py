@@ -23,7 +23,7 @@ from memory import format_memories_for_prompt
 
 
 def build_agent(
-    model_name: str = "llama3.2",
+    model_name: str = "gemma4:e4b",
     use_memory: bool = True,
     vision_model: str | None = None,
 ):
@@ -154,5 +154,7 @@ def build_agent(
     return app
 
 
-# Create a default agent instance
-agent = build_agent()
+# Create a default agent instance. Override the model with AGENT_MODEL; gemma4:e4b is the
+# validated default — it handles tool-calling and answers memory-recall questions from
+# context, whereas llama3.2 mis-fired (deleting a memory when asked to recall it).
+agent = build_agent(model_name=os.environ.get("AGENT_MODEL", "gemma4:e4b"))

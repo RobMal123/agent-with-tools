@@ -1,28 +1,35 @@
+# Versions are pinned (==) to the known-good set this project was built and
+# tested against, for reproducible installs and a smaller supply-chain surface.
+# Bump deliberately (and re-run `pytest`) rather than floating with `>=`.
+
 # Core
-langgraph>=0.2.0
-langchain>=0.3.0
-langchain-ollama>=0.2.0
-langchain-community>=0.3.0
-langchain-experimental>=0.3.0  # For PythonREPLTool
+langgraph==1.2.2
+langchain==1.3.2
+langchain-ollama==1.1.0
+langchain-community==0.4.2
+langchain-experimental==0.4.2  # For PythonREPLTool
+langchain-core==1.4.0
+langchain-text-splitters==1.1.2
 
 # Memory / RAG
-chromadb>=0.5.0
-langchain-chroma>=0.1.0
+chromadb==1.5.9
+langchain-chroma==1.1.0
 
 # Audio transcription (local Whisper model — also needs ffmpeg on PATH)
-faster-whisper>=1.1.0
+faster-whisper==1.2.1
 
 # API
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.0.0
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+pydantic==2.13.4
+requests==2.34.2
 
 # UI
-streamlit>=1.40.0
+streamlit==1.57.0
 
 # Observability
-langsmith>=0.1.0
+langsmith==0.8.5
 
 # Dev & testing
-pytest>=8.0.0
-python-dotenv>=1.0.0
+pytest==9.0.3
+python-dotenv==1.2.2

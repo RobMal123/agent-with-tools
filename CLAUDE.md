@@ -61,18 +61,18 @@ START → call_model → (tool calls?) → call_tools → call_model → ... →
 
 ## Tools
 
-`TOOLS` (14): `brave_search`, `python_repl`, `list_directory`, `read_file`, `write_md_file`, `transcribe_audio`, `save_memory`, `list_memories`, `delete_memory`, `index_document`, `search_documents`, `structure_thoughts`, `log_improvement`, `analyze_improvements`.
+`TOOLS` (13): `brave_search`, `python_repl`, `list_directory`, `read_file`, `write_md_file`, `transcribe_audio`, `save_memory`, `list_memories`, `index_document`, `search_documents`, `structure_thoughts`, `log_improvement`, `analyze_improvements`.
 
 Adding a new tool: define it with `@tool` in `tools.py`, append it to `TOOLS` at the bottom. The agent picks it up automatically — no changes to `graph.py` needed.
 
 - **`brave_search`** degrades gracefully: if `BRAVE_SEARCH_API_KEY` is unset or the request fails, it returns an `Error: …` string telling the model to answer from its own knowledge — it never raises (raising crashes the whole agent run).
-- **`python_repl`** is sandboxed: every snippet is prefixed with `os.chdir(workspace/)`, so files the agent writes land in `workspace/`, not the project root.
+- **`python_repl`** executes Python **in-process** (no real sandbox) and is **disabled by default** — set `ENABLE_CODE_EXECUTION=true` to enable it. The `os.chdir(workspace/)` prefix only sets the working dir so generated files land in `workspace/`; it is not a security boundary.
 - **`transcribe_audio`** lazy-loads faster-whisper into `_whisper_cache` (~970 MB for `small`, downloads to `~/.cache/huggingface/hub/`). Saves transcripts to `knowledge/meetings/<stem>.md` and auto-indexes them. Set `WHISPER_MODEL=medium` for better non-English/noisy accuracy.
 - **`structure_thoughts` / `analyze_improvements`** call a secondary `temperature=0` LLM via `_get_structure_llm()`. `build_agent()` calls `set_agent_model()` so this secondary LLM tracks the active model.
 
 ## Long-term memory
 
-`memory.py` stores facts as a flat JSON dict in `memory.json` (project root). `save_memory` / `list_memories` / `delete_memory` are agent tools; `format_memories_for_prompt()` is injected into the system prompt on every `call_model`. The app sidebar (🧠 Memory) shows entries with per-key delete + "Clear all". `memory.json` is gitignored.
+`memory.py` stores facts as a flat JSON dict in `memory.json` (project root). `save_memory` / `list_memories` are agent tools (deletion is intentionally **not** an agent tool — it's exposed only via the UI / `DELETE /api/memory/{key}` → `delete_memory_entry`); `format_memories_for_prompt()` is injected into the system prompt on every `call_model`. The app sidebar (🧠 Memory) shows entries with per-key delete + "Clear all". `memory.json` is gitignored.
 
 ## Semantic search (RAG)
 

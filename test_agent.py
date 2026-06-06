@@ -173,14 +173,28 @@ def temp_vectorstore(tmp_path):
     tools._CHROMA_DIR = old_dir
 
 
+@pytest.fixture
+def confined_base(tmp_path):
+    """
+    Point the file-tool sandbox root (tools._BASE_DIR) at a throwaway dir so tests
+    can operate on tmp_path files. read_file / write_md_file / list_directory confine
+    access to _BASE_DIR; production behaviour is unchanged (see test_read_file_blocks_traversal).
+    """
+    import tools
+    old = tools._BASE_DIR
+    tools._BASE_DIR = str(tmp_path)
+    yield tmp_path
+    tools._BASE_DIR = old
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 #  Pure unit tests (no LLM, no network) — fast
 # ════════════════════════════════════════════════════════════════════════════════
 
-def test_read_file_success(tmp_path):
-    """File reader should return file contents."""
+def test_read_file_success(confined_base):
+    """File reader should return file contents (inside the sandbox root)."""
     from tools import read_file
-    test_file = tmp_path / "test.txt"
+    test_file = confined_base / "test.txt"
     test_file.write_text("Hello from test file!")
     result = read_file.invoke(str(test_file))
     assert "Hello from test file!" in result
@@ -202,13 +216,31 @@ def test_read_file_unsupported_extension(tmp_path):
     assert "Error" in result
 
 
-def test_read_file_truncates_large_files(tmp_path):
+def test_read_file_truncates_large_files(confined_base):
     """File reader should truncate files > 8000 chars."""
     from tools import read_file
-    large_file = tmp_path / "large.txt"
+    large_file = confined_base / "large.txt"
     large_file.write_text("x" * 10000)
     result = read_file.invoke(str(large_file))
     assert "truncated" in result
+
+
+def test_read_file_blocks_traversal(confined_base):
+    """SECURITY: reads outside the sandbox root must be denied (path confinement)."""
+    from tools import read_file
+    outside = confined_base.parent / "outside.txt"   # sibling of the sandbox root
+    outside.write_text("top secret")
+    result = read_file.invoke(str(outside))
+    assert "access denied" in result
+    assert "top secret" not in result
+
+
+def test_python_repl_disabled_by_default(monkeypatch):
+    """SECURITY: code execution is opt-in; the tool must refuse unless enabled."""
+    from tools import python_repl
+    monkeypatch.delenv("ENABLE_CODE_EXECUTION", raising=False)
+    result = python_repl.invoke({"code": "print(2 + 2)"})
+    assert "disabled" in result.lower()
 
 
 def test_agent_graph_compiles():
@@ -250,12 +282,13 @@ def test_llm_answers_directly_without_tools():
 
 @requires_ollama
 @requires_text
-def test_tool_calling_does_real_math():
+def test_tool_calling_does_real_math(monkeypatch):
     """
     DISCRIMINATING: ask for 83621 * 7919 = 662194699.
     A small model cannot produce this 9-digit product without actually running
     the python_repl tool — so a correct answer proves the tool path works.
     """
+    monkeypatch.setenv("ENABLE_CODE_EXECUTION", "true")  # python_repl is opt-in since the security fix
     from graph import build_agent
     agent = build_agent(model_name=TEST_MODEL, use_memory=True)
     result, reply = _ask(
