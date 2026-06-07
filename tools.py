@@ -87,23 +87,77 @@ def _get_structure_llm() -> ChatOllama:
 
 _brave = BraveSearchWrapper(
     api_key=os.environ.get("BRAVE_SEARCH_API_KEY", ""),
-    search_kwargs={"count": 3},
+    search_kwargs={"count": 5},
 )
 
 
 @tool
 def brave_search(query: str) -> str:
-    """Search the web for current information. Use this for recent events, facts, or anything you're unsure about."""
+    """Search the web for current information — recent events, facts, or anything you're unsure about.
+
+    Write a single specific, focused query (key terms, not a whole sentence) — a precise query
+    returns far better results than a vague one. Returns up to 5 results as a numbered list of
+    title / snippet / source URL. Synthesise the findings in your own words and cite sources;
+    do not paste the raw results back to the user.
+    """
     # Degrade gracefully (like every other tool) instead of crashing the agent
     # when the API key is missing or the request fails.
     if not os.environ.get("BRAVE_SEARCH_API_KEY", "").strip():
         return ("Error: web search is unavailable because BRAVE_SEARCH_API_KEY is not set. "
                 "Answer from your own knowledge instead.")
     try:
-        return _brave.run(query)
+        raw = _brave.run(query)
     except Exception as e:
         return (f"Error: web search failed ({e}). "
                 "Answer from your own knowledge instead.")
+
+    # _brave.run() returns a JSON string: [{"title","link","snippet"}, ...]. Reformat it into a
+    # compact, readable list so the model synthesises the facts instead of echoing raw JSON, and
+    # truncate long snippets (Brave concatenates description + extra_snippets) to keep context tight.
+    try:
+        results = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw  # unexpected shape — hand back what we got rather than crash the run
+    if not results:
+        return (f"No web results found for '{query}'. Try a different query, or answer from "
+                "your own knowledge instead.")
+
+    lines = []
+    for i, item in enumerate(results, 1):
+        title   = (item.get("title") or "").strip()
+        snippet = " ".join((item.get("snippet") or "").split())
+        if len(snippet) > 300:
+            snippet = snippet[:300].rstrip() + "…"
+        link = (item.get("link") or "").strip()
+        lines.append(f"[{i}] {title}\n{snippet}\nSource: {link}")
+    return (
+        "Web search results (synthesise in your own words and cite [n]; do not paste verbatim):\n\n"
+        + "\n\n".join(lines)
+    )
+
+
+def extract_search_sources(tool_output: str) -> list[dict]:
+    """
+    Parse the "[n] title / snippet / Source: url" blocks that brave_search emits into a list
+    of {title, url} dicts (deduped by url, original order preserved). Returns [] for any other
+    tool output. Lives next to brave_search so the output format and this parser stay in sync —
+    main.py calls it to attach clickable sources to the chat bubble.
+    """
+    sources: list[dict] = []
+    seen: set = set()
+    current_title = ""
+    for line in (tool_output or "").splitlines():
+        line = line.strip()
+        m = re.match(r"^\[\d+\]\s*(.*)", line)
+        if m:
+            current_title = m.group(1).strip()
+        elif line.startswith("Source: "):
+            url = line[len("Source: "):].strip()
+            if url and url not in seen:
+                seen.add(url)
+                sources.append({"title": current_title or url, "url": url})
+            current_title = ""
+    return sources
 
 
 # ── Python REPL (DISABLED by default) ────────────────────────────────────────────

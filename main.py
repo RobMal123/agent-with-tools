@@ -44,9 +44,9 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before graph/tools are imported so env vars are set
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from graph import agent
+from graph import agent, build_agent
 from memory import load_memories, delete_memory_entry, clear_all_memories
-from tools import _index_file
+from tools import _index_file, set_agent_model, extract_search_sources
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 _BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -147,6 +147,7 @@ async def require_token(request: Request, call_next):
 class ChatRequest(BaseModel):
     message: str
     thread_id: str | None = None
+    model: str | None = None       # reasoning model (UI dropdown); None → server default
     image_b64: str | None = None   # base64-encoded image (no data: prefix)
     image_mime: str | None = None  # e.g. "image/png"
 
@@ -154,12 +155,19 @@ class ChatRequest(BaseModel):
 class StreamRequest(BaseModel):
     message: str
     thread_id: str | None = None
+    model: str | None = None       # reasoning model (UI dropdown); None → server default
+
+
+class Source(BaseModel):
+    title: str
+    url: str
 
 
 class ChatResponse(BaseModel):
     reply: str
     thread_id: str
     tool_calls_made: list[str]
+    sources: list[Source] = []
 
 
 class SaveIdeaRequest(BaseModel):
@@ -181,11 +189,16 @@ def _safe_thread_id(thread_id: str) -> str:
 
 
 def _get_ollama_models() -> list[str]:
-    """Query local Ollama for installed models."""
+    """Query local Ollama for installed models (excluding embedding-only models)."""
     try:
         import requests
         r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
-        models = [m["name"] for m in r.json().get("models", [])]
+        # Drop embedding models (e.g. nomic-embed-text) — they can't run a chat/tool loop,
+        # so they should never appear in the reasoning-model dropdown.
+        models = [
+            m["name"] for m in r.json().get("models", [])
+            if "embed" not in m["name"].lower()
+        ]
         return sorted(models) if models else ["llama3.2"]
     except Exception:
         return ["llama3.2"]
@@ -228,6 +241,30 @@ def _save_chat(thread_id: str, title: str, model: str, messages: list) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ── Per-request model selection ──────────────────────────────────────────────────
+# The UI dropdown switches the reasoning model per request. build_agent() is cheap
+# (ChatOllama loads the model lazily on first invoke), so we cache one compiled agent per
+# model name. Each agent has its own MemorySaver — fine here, because the UI starts a new
+# conversation whenever the model changes, so history is never shared across models.
+_DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "gemma4:e4b")
+_AGENT_CACHE: dict = {_DEFAULT_MODEL: agent}   # reuse the agent graph.py already built
+_active_model = _DEFAULT_MODEL
+
+
+def _get_agent(model: str | None):
+    """Return the compiled agent for `model`, building + caching it on first use."""
+    global _active_model
+    name = (model or "").strip() or _DEFAULT_MODEL
+    if name not in _AGENT_CACHE:
+        _AGENT_CACHE[name] = build_agent(model_name=name)
+    if name != _active_model:
+        # Keep the secondary-LLM tools (structure_thoughts/analyze_improvements) aligned with
+        # the active model. Single-user localhost tool → no locking around this global.
+        set_agent_model(name)
+        _active_model = name
+    return _AGENT_CACHE[name]
+
+
 # ── Core chat endpoints ────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -258,7 +295,7 @@ def chat(request: ChatRequest):
         lc_content = request.message
 
     try:
-        result = agent.invoke(
+        result = _get_agent(request.model).invoke(
             {"messages": [HumanMessage(content=lc_content)]},
             config=config,
         )
@@ -269,15 +306,21 @@ def chat(request: ChatRequest):
 
     reply = result["messages"][-1].content
     tool_calls_made = []
+    sources: list[dict] = []
     for msg in result["messages"]:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
                 tool_calls_made.append(tc["name"])
+        if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) == "brave_search":
+            for src in extract_search_sources(getattr(msg, "content", "") or ""):
+                if src not in sources:
+                    sources.append(src)
 
     return ChatResponse(
         reply=reply,
         thread_id=thread_id,
         tool_calls_made=list(set(tool_calls_made)),
+        sources=sources,
     )
 
 
@@ -290,17 +333,52 @@ def chat_stream(request: StreamRequest):
     """
     thread_id = request.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
+    agent = _get_agent(request.model)
 
     def event_generator():
-        for event in agent.stream(
+        # stream_mode=["messages", "updates"]:
+        #  • "messages" → (chunk, metadata) token deltas; emit only those from the main
+        #    "call_model" node so the echoed human message, tool results, and inner-tool LLMs
+        #    never reach the client (the old "values" mode concatenated all of them).
+        #  • "updates" → each node's state delta; scan it for tool calls so we can send the
+        #    tool names in a final frame, letting the UI show the "Tools used" pill on
+        #    streamed turns (previously only the non-streaming fallback set it).
+        tools_used: list[str] = []
+        sources: list[dict] = []
+        for mode, payload in agent.stream(
             {"messages": [HumanMessage(content=request.message)]},
             config=config,
-            stream_mode="values",
+            stream_mode=["messages", "updates"],
         ):
-            last_msg = event["messages"][-1]
-            if hasattr(last_msg, "content") and last_msg.content:
-                data = json.dumps({"token": last_msg.content, "thread_id": thread_id})
-                yield f"data: {data}\n\n"
+            if mode == "messages":
+                chunk, metadata = payload
+                if metadata.get("langgraph_node") == "call_model":
+                    text = getattr(chunk, "content", "")
+                    if text:
+                        data = json.dumps({"token": text, "thread_id": thread_id})
+                        yield f"data: {data}\n\n"
+            elif mode == "updates":
+                for node_out in payload.values():
+                    if not isinstance(node_out, dict):
+                        continue
+                    for msg in node_out.get("messages", []):
+                        for tc in getattr(msg, "tool_calls", None) or []:
+                            name = tc.get("name")
+                            if name and name not in tools_used:
+                                tools_used.append(name)
+                        # brave_search ToolMessage → clickable sources for the bubble
+                        if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) == "brave_search":
+                            for src in extract_search_sources(getattr(msg, "content", "") or ""):
+                                if src not in sources:
+                                    sources.append(src)
+        # Final metadata frame: tool names (for the pill) + web-search sources (clickable list).
+        meta: dict = {"thread_id": thread_id}
+        if tools_used:
+            meta["tools"] = tools_used
+        if sources:
+            meta["sources"] = sources
+        if len(meta) > 1:
+            yield f"data: {json.dumps(meta)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -316,10 +394,14 @@ def get_models() -> list[str]:
 
 @app.get("/api/status")
 def get_status():
-    """Return LangSmith tracing status for the sidebar badge."""
+    """Return LangSmith tracing status + the default reasoning model for the UI."""
     tracing = os.environ.get("LANGCHAIN_TRACING_V2", "").lower() == "true"
     project = os.environ.get("LANGCHAIN_PROJECT", "default") if tracing else None
-    return {"tracing_enabled": tracing, "langsmith_project": project}
+    return {
+        "tracing_enabled": tracing,
+        "langsmith_project": project,
+        "default_model": _DEFAULT_MODEL,
+    }
 
 
 # ── /api/chats ─────────────────────────────────────────────────────────────────

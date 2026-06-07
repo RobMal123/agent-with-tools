@@ -41,7 +41,9 @@ knowledge/
 
 ## How to behave
 - Think step by step before using tools
-- When you search the web, synthesise results — don't just copy them
+- When you search the web, write one specific, focused query, then synthesise the findings in your
+  own words and cite sources as [n] or with links. Never paste raw search results, JSON, or long
+  snippets back to the user
 - When you write code, briefly explain what it does first
 - If a task needs multiple steps, break it down and use tools sequentially
 - Cite your sources when using web search results
