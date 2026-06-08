@@ -34,8 +34,9 @@ START → call_model → (tool calls?) → call_tools → call_model → ... →
 
 `graph.py` builds and compiles this loop. `build_agent(model_name, use_memory=True, vision_model=None)` is the factory — it calls `set_agent_model()`, creates a fresh `ChatOllama` LLM, binds the TOOLS list, builds a separate vision LLM, wires up the graph nodes, and attaches a `MemorySaver` checkpointer for per-thread conversation history. The global `agent = build_agent()` at the bottom of `graph.py` is used by `main.py`; `app.py` manages its own agent instance in `st.session_state.agent` so the model can be switched at runtime.
 
-**`call_model` injects memory + routes vision per turn:**
+**`call_model` injects memory + date + routes vision per turn:**
 - Long-term memories (`format_memories_for_prompt()`) are loaded fresh on every call and appended to `SYSTEM_PROMPT`, so the LLM always sees the latest facts without a rebuild.
+- **The current date** (`datetime.now()`) is injected fresh on every call, with a nudge to use `brave_search` (and its `freshness` arg) and trust search results over its training cutoff for time-sensitive topics. Without this the model doesn't know "today" and answers recent questions from stale training data.
 - If the latest human message contains an `image_url` content part, the turn is routed to the **dedicated vision model** with a short `VISION_SYSTEM_PROMPT` and **no tools** (see Vision section). All other turns use the primary model with the full system prompt + tools.
 
 **Import structure:** all files use flat absolute imports (e.g. `from graph import agent`). The project is run as a script directory, not an installed package — `app.py` and `main.py` both prepend `sys.path.insert(0, dirname(__file__))`, and `conftest.py` does the same for pytest. Relative imports (`.state`, `.tools`) do **not** work here. **Do not add an `__init__.py`** to `files/` — it flips pytest into package-import mode and breaks `pytest test_agent.py` with `ModuleNotFoundError: graph` (one was removed for exactly this reason).
@@ -65,10 +66,18 @@ START → call_model → (tool calls?) → call_tools → call_model → ... →
 
 Adding a new tool: define it with `@tool` in `tools.py`, append it to `TOOLS` at the bottom. The agent picks it up automatically — no changes to `graph.py` needed.
 
-- **`brave_search`** degrades gracefully: if `BRAVE_SEARCH_API_KEY` is unset or the request fails, it returns an `Error: …` string telling the model to answer from its own knowledge — it never raises (raising crashes the whole agent run).
+- **`brave_search`** returns up to **5** results as a readable numbered `[n] title / snippet / Source: <url>` list (not raw JSON), so the model synthesises instead of pasting. An optional `freshness` arg (`pd`/`pw`/`pm`/`py` = past day/week/month/year) maps to Brave's recency filter for time-sensitive queries; default off so evergreen searches are unaffected. It degrades gracefully: if `BRAVE_SEARCH_API_KEY` is unset or the request fails, it returns an `Error: …` string telling the model to answer from its own knowledge — it never raises (raising crashes the whole agent run). The non-tool helper `extract_search_sources()` parses that output back into `{title, url}` so `main.py` can attach clickable sources to the chat bubble.
 - **`python_repl`** executes Python **in-process** (no real sandbox) and is **disabled by default** — set `ENABLE_CODE_EXECUTION=true` to enable it. The `os.chdir(workspace/)` prefix only sets the working dir so generated files land in `workspace/`; it is not a security boundary.
 - **`transcribe_audio`** lazy-loads faster-whisper into `_whisper_cache` (~970 MB for `small`, downloads to `~/.cache/huggingface/hub/`). Saves transcripts to `knowledge/meetings/<stem>.md` and auto-indexes them. Set `WHISPER_MODEL=medium` for better non-English/noisy accuracy.
 - **`structure_thoughts` / `analyze_improvements`** call a secondary `temperature=0` LLM via `_get_structure_llm()`. `build_agent()` calls `set_agent_model()` so this secondary LLM tracks the active model.
+
+## FastAPI backend (`main.py`)
+
+`main.py` serves the React UI in `../Research Companion/`. Notable behaviour:
+
+- **Per-request model switching.** `_get_agent(model)` caches one compiled agent per model name (cheap — `ChatOllama` loads lazily on first invoke); `/chat` and `/chat/stream` accept an optional `model` field, and `/api/status` returns `default_model` (= `AGENT_MODEL`) for the UI to pre-select. Each agent has its own `MemorySaver`, which is fine because the UI starts a fresh conversation when the model changes (history is never shared across models). Single-user/localhost, so no locking around the cache.
+- **Streaming.** `/chat/stream` uses `stream_mode=["messages", "updates"]`: it streams token deltas **only** from the `call_model` node (so the echoed prompt, raw tool output, and inner-tool LLMs never leak into the reply), then sends a final `{tools, sources}` SSE frame before `[DONE]`. The non-streaming `/chat` returns `tool_calls_made` + `sources` in its JSON. (The earlier `stream_mode="values"` emitted whole-state snapshots, which dumped the user's message + raw search results into the bubble — fixed.)
+- **`/api/models`** excludes embedding models (any name containing `embed`) so they aren't offered as chat models.
 
 ## Long-term memory
 
@@ -111,6 +120,7 @@ Ollama vision models can't process an image when **tools** are bound or a **long
 |-----|---------|---------|
 | `BRAVE_SEARCH_API_KEY` | `brave_search` (degrades gracefully if unset) | — |
 | `OLLAMA_BASE_URL` | Ollama host | `http://localhost:11434` |
+| `AGENT_MODEL` | Primary reasoning model (text + tools); the UI can override it per request | `gemma4:e4b` |
 | `VISION_MODEL` | Dedicated vision model for image turns | `gemma3:4b` |
 | `EMBED_MODEL` | RAG embedding model | `nomic-embed-text` |
 | `WHISPER_MODEL` | faster-whisper size | `small` |

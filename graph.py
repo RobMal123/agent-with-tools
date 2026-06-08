@@ -10,6 +10,7 @@ This is the standard ReAct (Reason + Act) loop pattern.
 """
 
 import os
+from datetime import datetime
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
@@ -107,9 +108,18 @@ def build_agent(
                 ))
         else:
             # Normal mode: primary model with full system prompt + tools.
+            # Inject today's date fresh on every call so the model knows what "recent/latest"
+            # means and searches the web for it, instead of answering from a stale training cutoff.
             memory_ctx = format_memories_for_prompt()
-            system_content = (
-                f"{SYSTEM_PROMPT}\n\n{memory_ctx}" if memory_ctx else SYSTEM_PROMPT
+            today = datetime.now().strftime("%A, %d %B %Y")
+            date_ctx = (
+                f"Today's date is {today}. Your training data has a cutoff, so for anything recent "
+                f"or time-sensitive (news, 'latest', 'current', prices, releases) use brave_search — "
+                f"set its freshness argument (pd/pw/pm/py = past day/week/month/year) for the newest "
+                f"results — and trust the search results over your own memory."
+            )
+            system_content = "\n\n".join(
+                [SYSTEM_PROMPT, date_ctx] + ([memory_ctx] if memory_ctx else [])
             )
             messages = [SystemMessage(content=system_content)] + list(state["messages"])
             response = llm_with_tools.invoke(messages)

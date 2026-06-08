@@ -92,13 +92,17 @@ _brave = BraveSearchWrapper(
 
 
 @tool
-def brave_search(query: str) -> str:
+def brave_search(query: str, freshness: str = "") -> str:
     """Search the web for current information — recent events, facts, or anything you're unsure about.
 
     Write a single specific, focused query (key terms, not a whole sentence) — a precise query
     returns far better results than a vague one. Returns up to 5 results as a numbered list of
     title / snippet / source URL. Synthesise the findings in your own words and cite sources;
     do not paste the raw results back to the user.
+
+    freshness (optional): limit results by recency for time-sensitive queries —
+    "pd" past day, "pw" past week, "pm" past month, "py" past year. Leave empty for no time
+    filter (best for evergreen facts). Use it when the user wants the latest / most recent info.
     """
     # Degrade gracefully (like every other tool) instead of crashing the agent
     # when the API key is missing or the request fails.
@@ -106,7 +110,17 @@ def brave_search(query: str) -> str:
         return ("Error: web search is unavailable because BRAVE_SEARCH_API_KEY is not set. "
                 "Answer from your own knowledge instead.")
     try:
-        raw = _brave.run(query)
+        fresh = (freshness or "").strip().lower()
+        if fresh in ("pd", "pw", "pm", "py"):
+            # Per-call recency filter: build a wrapper with Brave's freshness window so only the
+            # default (no-filter) path keeps using the shared module-level _brave instance.
+            _fresh_brave = BraveSearchWrapper(
+                api_key=os.environ.get("BRAVE_SEARCH_API_KEY", ""),
+                search_kwargs={"count": 5, "freshness": fresh},
+            )
+            raw = _fresh_brave.run(query)
+        else:
+            raw = _brave.run(query)
     except Exception as e:
         return (f"Error: web search failed ({e}). "
                 "Answer from your own knowledge instead.")
