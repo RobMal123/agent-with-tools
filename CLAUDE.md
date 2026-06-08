@@ -93,9 +93,9 @@ ChromaDB (local, embedded, in `chroma_db/`) + Ollama embeddings (`nomic-embed-te
 
 ## Vision / multimodal
 
-Ollama vision models can't process an image when **tools** are bound or a **long system prompt** precedes it — and the primary models here can't do vision at all (`llama3.2` is text-only; the custom `gemma4` build advertises a `vision` capability that doesn't actually work in Ollama). So image turns are routed to a **dedicated vision model**.
+Image turns are routed to a **dedicated vision model** — a separate `ChatOllama` invoked with **no tools** and a short `VISION_SYSTEM_PROMPT`. The route exists because not every model can see (`llama3.2` is text-only, and the older `gemma4:e4b` advertised a vision capability that didn't actually work in Ollama), and some Ollama vision models misbehave with tools bound or a long prompt.
 
-- `build_agent(..., vision_model=None)` → defaults to `VISION_MODEL` env or `gemma3:4b`. `gemma3` has working vision in Ollama but **does not support tools** — fine, image turns don't need them.
+- `build_agent(..., vision_model=None)` → defaults to `VISION_MODEL` env or `gemma3:4b`. **In this setup `VISION_MODEL=gemma4:12b`** — gemma4:12b has working vision (verified with the discriminating tests, and it reads images correctly *even* with all tools bound + the full system prompt). Pointing the route at it means image + text share one model in VRAM (no `gemma3:4b` swap) when gemma4:12b is the primary, and image turns still work if you switch the primary to a text-only model.
 - `call_model` detects an `image_url` part in the latest human message and invokes the plain vision LLM with `VISION_SYSTEM_PROMPT` only. Tool use + full prompt resume on the next text turn. The two models swap in/out of VRAM as you alternate (a few seconds' load latency — normal).
 - `app.py` builds the multimodal `HumanMessage` (content list with a `data:` URL). Because `st.file_uploader` can return `None` on the `st.chat_input` rerun, the uploaded image bytes are stashed in `st.session_state["_queued_img"]` and consumed on submit.
 
