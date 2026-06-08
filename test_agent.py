@@ -12,13 +12,14 @@ Design principle (learned the hard way):
         - vision        -> reading specific digits / naming specific colors
         - memory        -> recalling an unguessable codeword
         - RAG           -> retrieving a unique fact only present in the indexed doc
+        - multi-turn    -> combining two specific earlier products across a 5-turn thread
 
 These hit a live Ollama instance and are slower than unit tests. They SKIP
 cleanly (not fail) when Ollama isn't running or a required model isn't pulled.
 
 Required models (skipped individually if missing):
-    TEST_MODEL          (default: llama3.2)        — reasoning + tool calls
-    TEST_VISION_MODEL   (default: gemma3:4b)       — image turns
+    TEST_MODEL          (default: gemma4:12b)      — reasoning + tool calls
+    TEST_VISION_MODEL   (default: gemma4:12b)      — image turns
     EMBED_MODEL         (default: nomic-embed-text)— RAG embeddings
 """
 
@@ -36,8 +37,8 @@ from langchain_core.messages import HumanMessage, AIMessage
 # ── Environment / availability ──────────────────────────────────────────────────
 
 OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-TEST_MODEL       = os.environ.get("TEST_MODEL", "llama3.2")
-TEST_VISION_MODEL = os.environ.get("TEST_VISION_MODEL", "gemma3:4b")
+TEST_MODEL       = os.environ.get("TEST_MODEL", "gemma4:12b")
+TEST_VISION_MODEL = os.environ.get("TEST_VISION_MODEL", "gemma4:12b")
 EMBED_MODEL      = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 
 
@@ -94,6 +95,21 @@ def _digits(text: str) -> str:
     return re.sub(r"\D", "", text)
 
 
+def _result_number(text: str) -> int:
+    """
+    The largest integer mentioned in `text`. For a multiply/add reply that is the
+    computed result — the product/sum is larger than the operands it echoes — so
+    this reads back the value the agent actually produced, even when the reply
+    restates the inputs (e.g. '60127 * 7919 = 476145713'). Returns -1 if none.
+
+    Handles thousands separators: a comma-grouped number like '23,159,016' is read
+    as one value, not split into 23 / 159 / 016 (which would mask the real result).
+    """
+    candidates = re.findall(r"\d{1,3}(?:,\d{3})+|\d+", text)
+    nums = [int(c.replace(",", "")) for c in candidates]
+    return max(nums) if nums else -1
+
+
 def _tools_used(result: dict) -> list:
     """Names of every tool the agent actually called during a run."""
     used = []
@@ -137,6 +153,17 @@ def _ask(agent, text, image=None):
         msg = HumanMessage(content=text)
     cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
     result = agent.invoke({"messages": [msg]}, config=cfg)
+    return result, result["messages"][-1].content
+
+
+def _turn(agent, cfg, text):
+    """
+    One turn of a *multi-turn* conversation. Unlike `_ask`, the caller reuses the
+    same `cfg` (same thread_id) across calls, so the MemorySaver checkpointer
+    accumulates history and the agent can see what happened in earlier turns.
+    Returns (full_state, last_reply_text).
+    """
+    result = agent.invoke({"messages": [HumanMessage(content=text)]}, config=cfg)
     return result, result["messages"][-1].content
 
 
@@ -298,6 +325,84 @@ def test_tool_calling_does_real_math(monkeypatch):
     )
     assert "662194699" in _digits(reply), (
         f"expected 662194699 in answer; tools_used={_tools_used(result)}; reply={reply!r}"
+    )
+
+
+@requires_ollama
+@requires_text
+def test_multiturn_cross_turn_tool_combination(monkeypatch):
+    """
+    DISCRIMINATING + MULTI-TURN: a 5-turn conversation on ONE persistent thread
+    where every turn drives the python_repl tool, and the final turn can only be
+    answered by combining the results of turn 2 AND turn 4 specifically.
+
+    Why this can't pass unless the real machinery works:
+      - Each turn asks for a product of 4–5 digit numbers — too big to do in the
+        head — so the tool must run. We assert python_repl actually fired on every
+        turn by inspecting the recorded tool_calls (not just the reply text).
+      - Turns 1 and 3 are DISTRACTORS; their products must not leak into the finale.
+      - The finale asks for ALPHA + BETA (the products from turns 2 and 4). We read
+        back what the agent actually computed in those two turns and require the
+        final answer to equal exactly their sum. With no cross-turn memory the model
+        can't see ALPHA/BETA at all; recalling only one — or grabbing a turn-1/turn-3
+        distractor — gives the wrong total; and adding two ~9-digit numbers reliably
+        needs the tool rather than mental arithmetic. So a correct sum, together with
+        the recorded python_repl calls, implies retention across turns AND a real tool
+        call on the final turn.
+
+    We deliberately read the agent's own turn-2/turn-4 results instead of hard-coding
+    the products: small Ollama models occasionally mistype an operand into the tool
+    call, and this test targets the *cross-turn combination*, so it holds the finale
+    to the sum of whatever the agent genuinely produced in turns 2 and 4.
+    """
+    monkeypatch.setenv("ENABLE_CODE_EXECUTION", "true")  # python_repl is opt-in
+    from graph import build_agent
+    agent = build_agent(model_name=TEST_MODEL, use_memory=True)
+
+    # One thread for the whole conversation (reused cfg => accumulating history).
+    cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+
+    def _calc(text):
+        """Run one turn and return (full_state, reply, the number the agent computed)."""
+        result, reply = _turn(agent, cfg, text)
+        return result, reply, _result_number(reply)
+
+    # Turn 1 (tool) — distractor product
+    _, a1, n1 = _calc("Use the python_repl tool to calculate 4392 * 5273. "
+                      "Report the exact integer result.")
+    assert n1 >= 1_000_000, f"turn 1 did not return a computed product; reply={a1!r}"
+
+    # Turn 2 (tool) — ALPHA: the first value the finale must combine
+    _, a2, alpha = _calc("Now use the python_repl tool to calculate 60127 * 7919. "
+                         "Remember this product as ALPHA and report the exact integer result.")
+    assert alpha >= 1_000_000, f"turn 2 (ALPHA) did not return a product; reply={a2!r}"
+
+    # Turn 3 (tool) — distractor product
+    _, a3, n3 = _calc("Use the python_repl tool to calculate 8124 * 3307. "
+                      "Report the exact integer result.")
+    assert n3 >= 1_000_000, f"turn 3 did not return a computed product; reply={a3!r}"
+
+    # Turn 4 (tool) — BETA: the second value the finale must combine
+    _, a4, beta = _calc("Now use the python_repl tool to calculate 51237 * 9043. "
+                        "Remember this product as BETA and report the exact integer result.")
+    assert beta >= 1_000_000, f"turn 4 (BETA) did not return a product; reply={a4!r}"
+
+    # Turn 5 (tool) — combine ONLY turn 2 (ALPHA) + turn 4 (BETA)
+    r5, a5, got = _calc(
+        "Using the python_repl tool, add together ALPHA and BETA — the two products "
+        "you computed earlier — and report the exact total."
+    )
+    assert got == alpha + beta, (
+        f"cross-turn combination failed: expected ALPHA+BETA={alpha + beta} "
+        f"(ALPHA={alpha} from turn 2, BETA={beta} from turn 4), got {got}; "
+        f"tools_used={_tools_used(r5)}; reply={a5!r}"
+    )
+
+    # Direct proof every turn exercised the tool: r5 holds the full thread, so this
+    # counts python_repl tool_calls across all 5 turns.
+    used = _tools_used(r5)
+    assert used.count("python_repl") >= 5, (
+        f"expected a python_repl call on each of the 5 turns; used={used}"
     )
 
 

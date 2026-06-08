@@ -21,8 +21,9 @@ pytest test_agent.py::test_vision_distinguishes_colors -v
 All commands must be run from the `files/` directory. The virtual environment is in `venv/`.
 
 The test suite makes **real Ollama calls** and needs these models pulled:
-`ollama pull llama3.2` · `ollama pull gemma3:4b` · `ollama pull nomic-embed-text`.
+`ollama pull gemma4:12b` · `ollama pull nomic-embed-text`.
 Tests skip cleanly (not fail) when Ollama is down or a model is missing.
+(Both the reasoning and vision test models default to `gemma4:12b` — the shipped model — overridable via `TEST_MODEL` / `TEST_VISION_MODEL`.)
 
 ## Architecture
 
@@ -135,6 +136,7 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 - **vision** → reads specific digits / names red-green-blue (the regression guard for the vision saga; a blind model answering "Black" to everything fails it)
 - **memory** → recalls an unguessable codeword (proves prompt injection)
 - **RAG** → retrieves a unique invented fact (proves embeddings + vector search)
+- **multi-turn tool use** → a 5-turn conversation (every turn drives `python_repl`) whose final answer must combine the products from turns 2 and 4 (proves the `MemorySaver` checkpointer carries cross-turn context and the agent picks the right two values, not the turn-1/3 distractors)
 
 Tests `skipif` Ollama is down or a model isn't pulled. Fixtures isolate side effects: `preserve_memory` snapshots/restores `memory.json`; `temp_vectorstore` points ChromaDB at a throwaway dir. That's isolation, not mocking — the real LLM/embeddings/vector search still run.
 
