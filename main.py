@@ -241,6 +241,42 @@ def _save_chat(thread_id: str, title: str, model: str, messages: list) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _conversation_dicts(lc_messages: list) -> list[dict]:
+    """Convert LangChain messages to the saved-chat {role, content} format — user prompts and
+    assistant replies only (SystemMessages, ToolMessages, and tool-call-only AI messages are
+    dropped). Multimodal human turns are flattened to their text with an image note."""
+    out: list[dict] = []
+    for m in lc_messages:
+        typ = getattr(m, "type", None)
+        if typ == "human":
+            content = m.content
+            if isinstance(content, list):  # multimodal (text + image parts)
+                text = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ).strip()
+                content = (text + " *(image attached)*").strip()
+            out.append({"role": "user", "content": content})
+        elif typ == "ai" and isinstance(m.content, str) and m.content.strip():
+            out.append({"role": "assistant", "content": m.content})
+    return out
+
+
+def _persist_conversation(thread_id: str, model: str, lc_messages: list) -> None:
+    """Save a thread's full conversation to chats/<id>.json. Non-fatal: a save failure must
+    never break the chat response. Called after every /chat and /chat/stream turn so the React
+    UI's saved-chats list actually updates (the endpoints previously never persisted anything)."""
+    try:
+        msgs = _conversation_dicts(lc_messages)
+        if not msgs:
+            return
+        first = msgs[0]["content"]
+        title = first[:60] + ("…" if len(first) > 60 else "")
+        _save_chat(thread_id, title, model, msgs)
+    except Exception:
+        traceback.print_exc()
+
+
 # ── Per-request model selection ──────────────────────────────────────────────────
 # The UI dropdown switches the reasoning model per request. build_agent() is cheap
 # (ChatOllama loads the model lazily on first invoke), so we cache one compiled agent per
@@ -316,6 +352,10 @@ def chat(request: ChatRequest):
                 if src not in sources:
                     sources.append(src)
 
+    _persist_conversation(
+        thread_id, (request.model or "").strip() or _DEFAULT_MODEL, result["messages"]
+    )
+
     return ChatResponse(
         reply=reply,
         thread_id=thread_id,
@@ -371,6 +411,17 @@ def chat_stream(request: StreamRequest):
                             for src in extract_search_sources(getattr(msg, "content", "") or ""):
                                 if src not in sources:
                                     sources.append(src)
+        # Persist the conversation now the turn is complete (pull the full thread from the
+        # checkpointed state). Non-fatal — a save failure must not break the stream.
+        try:
+            _persist_conversation(
+                thread_id,
+                (request.model or "").strip() or _DEFAULT_MODEL,
+                agent.get_state(config).values.get("messages", []),
+            )
+        except Exception:
+            traceback.print_exc()
+
         # Final metadata frame: tool names (for the pill) + web-search sources (clickable list).
         meta: dict = {"thread_id": thread_id}
         if tools_used:
