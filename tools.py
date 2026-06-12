@@ -21,8 +21,22 @@ from memory import load_memories, save_memory_entry
 
 # ── Paths ───────────────────────────────────────────────────────────────────────
 _BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+
+# ── Obsidian vault integration ───────────────────────────────────────────────────
+# An Obsidian vault is just a folder of Markdown files on disk. We treat the vault
+# as the agent's knowledge home: it READS / SEARCHES the whole vault but only WRITES
+# into a dedicated subfolder (VAULT_AI_SUBDIR) so the user's own notes are never
+# touched or overwritten. Set OBSIDIAN_VAULT in .env to enable; when it is empty or
+# the path doesn't exist the agent falls back to the in-project knowledge/ folder
+# (so first-run and the test suite — which never loads .env — behave exactly as before).
+VAULT_DIR       = os.environ.get("OBSIDIAN_VAULT", "").strip().strip('"')
+VAULT_ENABLED   = bool(VAULT_DIR) and os.path.isdir(VAULT_DIR)
+VAULT_AI_SUBDIR = (os.environ.get("OBSIDIAN_AI_SUBDIR", "AI Assistant") or "AI Assistant").strip()
+
 AUDIO_IN_DIR     = os.path.join(_BASE_DIR, "audio_in")
-KNOWLEDGE_DIR    = os.path.join(_BASE_DIR, "knowledge")
+# Knowledge lives inside the vault subfolder when a vault is configured, else in-project.
+KNOWLEDGE_DIR    = os.path.join(VAULT_DIR, VAULT_AI_SUBDIR) if VAULT_ENABLED \
+                   else os.path.join(_BASE_DIR, "knowledge")
 MEETINGS_DIR     = os.path.join(KNOWLEDGE_DIR, "meetings")
 IDEAS_DIR        = os.path.join(KNOWLEDGE_DIR, "ideas")
 PROJECTS_DIR     = os.path.join(KNOWLEDGE_DIR, "projects")
@@ -33,26 +47,95 @@ _CHROMA_DIR      = os.path.join(_BASE_DIR, "chroma_db")
 # Legacy — kept so existing files in transcriptions/ still resolve via read_file
 TRANSCRIPTIONS_DIR = os.path.join(_BASE_DIR, "transcriptions")
 
-# Ensure all runtime directories exist at import time
+# Ensure all runtime directories exist at import time (creates the agent's subfolder
+# tree inside the vault on first run — that subfolder IS the integration point).
 for _d in (MEETINGS_DIR, IDEAS_DIR, PROJECTS_DIR, REPORTS_DIR,
            IMPROVEMENTS_DIR, WORKSPACE_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
-def _resolve_in_base(path: str) -> str | None:
+# ── Filesystem sandbox ────────────────────────────────────────────────────────────
+# File tools are confined to a set of allowed roots: always the project directory,
+# plus the Obsidian vault when configured. This keeps the agent from reaching
+# arbitrary paths while letting it read/write across both the project and the vault.
+def _allowed_roots() -> list[str]:
+    roots = [os.path.realpath(_BASE_DIR)]
+    if VAULT_ENABLED:
+        roots.append(os.path.realpath(VAULT_DIR))
+    return roots
+
+
+def _resolve_in_base(path: str, base: str | None = None) -> str | None:
     """
-    Resolve an agent-supplied path against the project directory and confine it
-    there. Relative paths are taken relative to the project root; absolute paths
-    are allowed only if they fall inside it. Returns the real absolute path, or
-    None if it would escape _BASE_DIR (symlinks are resolved first).
+    Resolve an agent-supplied path and confine it to an allowed root (the project
+    directory, or the Obsidian vault when configured). Relative paths are taken
+    relative to `base` (default: the project root); absolute paths are allowed only
+    if they fall inside an allowed root. Returns the real absolute path, or None if
+    it would escape every allowed root (symlinks are resolved first).
     """
-    candidate = path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
+    candidate = path if os.path.isabs(path) else os.path.join(base or _BASE_DIR, path)
     real = os.path.realpath(candidate)
-    base = os.path.realpath(_BASE_DIR)
-    real_nc, base_nc = os.path.normcase(real), os.path.normcase(base)
-    if real_nc == base_nc or real_nc.startswith(base_nc + os.sep):
-        return real
+    real_nc = os.path.normcase(real)
+    for root in _allowed_roots():
+        root_nc = os.path.normcase(root)
+        if real_nc == root_nc or real_nc.startswith(root_nc + os.sep):
+            return real
     return None
+
+
+# ── Obsidian-native note formatting (YAML frontmatter + [[wikilinks]]) ────────────
+# Notes the agent writes get a frontmatter block (type/date/tags/source) so they are
+# filterable in Obsidian (tag search, Dataview), plus a wikilink back to a per-type
+# hub note so they show up connected in the graph view instead of as orphans.
+def _yaml_escape(v: str) -> str:
+    """Quote a scalar for YAML frontmatter if it contains characters that need it."""
+    s = str(v).replace("\n", " ").replace('"', "'").strip()
+    if s == "" or re.search(r'[:#\[\]{}",&*?|<>=!%@`]', s):
+        return f'"{s}"'
+    return s
+
+
+def _frontmatter(title: str, note_type: str, tags=None, source: str = "",
+                 date: str = "", extra: dict | None = None) -> str:
+    """Build a YAML frontmatter block, terminated with a blank line so it can be
+    prepended directly to note content."""
+    date = date or datetime.now().strftime("%Y-%m-%d")
+    tags = list(tags or [])
+    for t in (note_type, "ai-generated"):
+        if t and t not in tags:
+            tags.append(t)
+    lines = ["---",
+             f"title: {_yaml_escape(title)}",
+             f"type: {_yaml_escape(note_type or 'note')}",
+             f"date: {date}",
+             f"created: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+             "tags:"]
+    lines += [f"  - {t}" for t in tags]
+    if source:
+        lines.append(f"source: {_yaml_escape(source)}")
+    for k, v in (extra or {}).items():
+        lines.append(f"{k}: {_yaml_escape(v)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"   # blank line between frontmatter and content
+
+
+# Per-type hub (Map-Of-Content) note each generated note links back to. The hubs need
+# not exist yet — Obsidian resolves the link when clicked; the home note is created by
+# ensure_vault_home().
+_TYPE_HUB = {
+    "meeting":     "Meetings",
+    "idea":        "Ideas",
+    "project":     "Projects",
+    "report":      "Reports",
+    "improvement": "Improvements",
+}
+
+
+def _hub_link(note_type: str) -> str:
+    """A one-line wikilink connecting a note to its type hub and the vault home note."""
+    home = VAULT_AI_SUBDIR or "AI Assistant"
+    hub  = _TYPE_HUB.get(note_type)
+    return f"Part of [[{hub}]] · [[{home}]]" if hub else f"Part of [[{home}]]"
 
 
 # ── Agent model tracking ────────────────────────────────────────────────────────
@@ -110,6 +193,11 @@ def brave_search(query: str, freshness: str = "") -> str:
         return ("Error: web search is unavailable because BRAVE_SEARCH_API_KEY is not set. "
                 "Answer from your own knowledge instead.")
     try:
+        now = datetime.now()
+        # Append current month+year to the query so Brave's ranking favours current results.
+        # Without this, queries like "latest AI news" return 2024/2025 results because the
+        # query itself carries no date signal.
+        dated_query = f"{query} {now.strftime('%B %Y')}"
         fresh = (freshness or "").strip().lower()
         if fresh in ("pd", "pw", "pm", "py"):
             # Per-call recency filter: build a wrapper with Brave's freshness window so only the
@@ -118,9 +206,9 @@ def brave_search(query: str, freshness: str = "") -> str:
                 api_key=os.environ.get("BRAVE_SEARCH_API_KEY", ""),
                 search_kwargs={"count": 5, "freshness": fresh},
             )
-            raw = _fresh_brave.run(query)
+            raw = _fresh_brave.run(dated_query)
         else:
-            raw = _brave.run(query)
+            raw = _brave.run(dated_query)
     except Exception as e:
         return (f"Error: web search failed ({e}). "
                 "Answer from your own knowledge instead.")
@@ -144,8 +232,9 @@ def brave_search(query: str, freshness: str = "") -> str:
             snippet = snippet[:300].rstrip() + "…"
         link = (item.get("link") or "").strip()
         lines.append(f"[{i}] {title}\n{snippet}\nSource: {link}")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return (
-        "Web search results (synthesise in your own words and cite [n]; do not paste verbatim):\n\n"
+        f"Web search results (searched at {now}; synthesise in your own words and cite [n]; do not paste verbatim):\n\n"
         + "\n\n".join(lines)
     )
 
@@ -227,7 +316,7 @@ def read_file(file_path: str) -> str:
 
     abs_path = _resolve_in_base(file_path)
     if abs_path is None:
-        return "Error: access denied — path is outside the project directory."
+        return "Error: access denied — path is outside the project or vault."
 
     if not os.path.exists(abs_path):
         return f"Error: File not found at '{file_path}'."
@@ -245,18 +334,31 @@ def read_file(file_path: str) -> str:
 @tool
 def write_md_file(file_path: str, content: str) -> str:
     """
-    Create or overwrite a Markdown (.md) file with the given content.
-    Use this to save notes, summaries, reports, or research findings to disk.
-    The file_path must end with .md — e.g. 'notes.md' or 'knowledge/reports/summary.md'.
-    Parent directories are created automatically if they do not exist.
+    Create or overwrite a Markdown (.md) note in the knowledge base (the Obsidian
+    vault when one is configured). Use this to save notes, summaries, reports, or
+    research findings.
+
+    Give a path relative to the knowledge home, e.g. 'reports/ai-news.md' or
+    'meetings/standup.md' — it lands in the right folder of the vault. Parent
+    folders are created automatically. YAML frontmatter (type/date/tags) is added
+    for you if you don't write your own. Use Obsidian [[wikilinks]] in the body to
+    connect related notes.
     """
     if not file_path.endswith(".md"):
         return "Error: file_path must end with .md"
 
-    abs_path = _resolve_in_base(file_path)
+    # Relative note paths resolve under the knowledge home (the vault subfolder);
+    # absolute paths are still allowed as long as they stay inside an allowed root.
+    abs_path = _resolve_in_base(file_path, base=KNOWLEDGE_DIR)
     if abs_path is None:
-        return "Error: access denied — path is outside the project directory."
+        return "Error: access denied — path is outside the project or vault."
     parent   = os.path.dirname(abs_path)
+
+    # Make notes first-class in Obsidian: prepend frontmatter unless the model
+    # already supplied its own block.
+    if not content.lstrip().startswith("---"):
+        title = os.path.splitext(os.path.basename(abs_path))[0]
+        content = _frontmatter(title=title, note_type=_infer_doc_type(abs_path)) + content
 
     try:
         if parent:
@@ -280,7 +382,7 @@ def list_directory(path: str = ".") -> str:
     """
     target = _resolve_in_base(path)
     if target is None:
-        return "Error: access denied — path is outside the project directory."
+        return "Error: access denied — path is outside the project or vault."
 
     if not os.path.exists(target):
         return f"Error: path not found — '{target}'"
@@ -347,7 +449,7 @@ def transcribe_audio(file_path: str) -> str:
 
     abs_path = _resolve_in_base(file_path)
     if abs_path is None:
-        return "Error: access denied — path is outside the project directory."
+        return "Error: access denied — path is outside the project or vault."
     if not os.path.exists(abs_path):
         return f"Error: file not found — '{file_path}'"
 
@@ -364,11 +466,15 @@ def transcribe_audio(file_path: str) -> str:
         md_path   = os.path.join(MEETINGS_DIR, f"{stem}.md")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         md_content = (
-            f"# Transcription: {stem}\n\n"
-            f"**Date:** {timestamp}  \n"
-            f"**Language detected:** {language}  \n"
-            f"**Source:** {abs_path}\n\n"
-            f"---\n\n{text}\n"
+            _frontmatter(title=f"Transcription: {stem}", note_type="meeting",
+                         tags=["transcript"], source=abs_path,
+                         extra={"language": language})
+            + f"# Transcription: {stem}\n\n"
+            + f"{_hub_link('meeting')}\n\n"
+            + f"**Date:** {timestamp}  \n"
+            + f"**Language detected:** {language}  \n"
+            + f"**Source:** {abs_path}\n\n"
+            + f"---\n\n{text}\n"
         )
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
@@ -539,6 +645,70 @@ def _auto_index(abs_path: str, doc_type: str = "") -> None:
         pass
 
 
+# ── Obsidian vault: bulk indexing + home note ────────────────────────────────────
+_VAULT_SKIP_DIRS = {".obsidian", ".trash", ".git", "node_modules"}
+
+
+def index_vault(verbose: bool = False) -> dict:
+    """
+    Index every Markdown note in the configured Obsidian vault (the user's existing
+    notes plus the agent's own) into the semantic search store, so search_documents
+    can recall them. Skips Obsidian/system folders. Safe to re-run — each file's
+    stale chunks are replaced. Returns {indexed, skipped, errors}.
+    """
+    if not VAULT_ENABLED:
+        return {"indexed": 0, "skipped": 0,
+                "errors": ["No Obsidian vault configured — set OBSIDIAN_VAULT in .env."]}
+
+    ensure_vault_home()
+    indexed = skipped = 0
+    errors: list[str] = []
+    for root, dirs, files in os.walk(VAULT_DIR):
+        dirs[:] = [d for d in dirs if d not in _VAULT_SKIP_DIRS]
+        for fn in files:
+            if not fn.lower().endswith(".md"):
+                continue
+            status = _index_file(os.path.join(root, fn))
+            if status.startswith("Indexed"):
+                indexed += 1
+                if verbose:
+                    print(status)
+            else:
+                skipped += 1
+                errors.append(status)
+    return {"indexed": indexed, "skipped": skipped, "errors": errors}
+
+
+def ensure_vault_home() -> str | None:
+    """
+    Create the agent's home note (a Map-Of-Content) at the root of its vault
+    subfolder, linking to the per-type hubs so the graph view has structure.
+    Idempotent — never overwrites an existing home note. Returns its path, or None
+    when no vault is configured.
+    """
+    if not VAULT_ENABLED:
+        return None
+    os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+    home = os.path.join(KNOWLEDGE_DIR, f"{VAULT_AI_SUBDIR}.md")
+    if os.path.exists(home):
+        return home
+    body = (
+        f"# {VAULT_AI_SUBDIR}\n\n"
+        "Home for notes created by the local AI research assistant. The assistant "
+        "reads and semantically searches this whole vault, and writes its own notes "
+        "into the folders below (kept in sync with search).\n\n"
+        "## Sections\n"
+        "- [[Meetings]] — transcripts & summaries\n"
+        "- [[Ideas]] — structured thoughts\n"
+        "- [[Projects]] — project plans\n"
+        "- [[Reports]] — research & reports\n"
+        "- [[Improvements]] — friction & bug log\n"
+    )
+    with open(home, "w", encoding="utf-8") as f:
+        f.write(_frontmatter(title=VAULT_AI_SUBDIR, note_type="moc", tags=["moc"]) + body)
+    return home
+
+
 @tool
 def index_document(file_path: str, doc_type: str = "") -> str:
     """
@@ -557,7 +727,7 @@ def index_document(file_path: str, doc_type: str = "") -> str:
 
     abs_path = _resolve_in_base(file_path)
     if abs_path is None:
-        return "Error: access denied — path is outside the project directory."
+        return "Error: access denied — path is outside the project or vault."
     if not os.path.exists(abs_path):
         return f"Error: file not found — '{file_path}'"
 
@@ -713,9 +883,13 @@ Input:
         filled = _TEMPLATES[template_type].format(**{k: data.get(k, "—") for k in fields})
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         full_doc  = (
-            f"# {template_type.capitalize()} – {timestamp}\n\n"
-            f"{filled}\n\n"
-            f"---\n*Source input:* {input_text[:200]}{'…' if len(input_text) > 200 else ''}\n"
+            _frontmatter(title=f"{template_type.capitalize()} – {timestamp}",
+                         note_type="idea", tags=[template_type],
+                         source=input_text[:80])
+            + f"# {template_type.capitalize()} – {timestamp}\n\n"
+            + f"{_hub_link('idea')}\n\n"
+            + f"{filled}\n\n"
+            + f"---\n*Source input:* {input_text[:200]}{'…' if len(input_text) > 200 else ''}\n"
         )
 
         # Save to knowledge/ideas/
@@ -777,8 +951,11 @@ def log_improvement(input_text: str) -> str:
     fname     = datetime.now().strftime("improvement_%Y-%m-%d_%H-%M.md")
     out_path  = os.path.join(IMPROVEMENTS_DIR, fname)
 
-    md = f"""\
+    md = _frontmatter(title=f"Improvement – {timestamp}", note_type="improvement",
+                      source=sections["problem"][:80]) + f"""\
 # Improvement – {timestamp}
+
+{_hub_link('improvement')}
 
 ## Problem
 {sections['problem'] or '—'}

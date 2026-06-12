@@ -16,6 +16,9 @@ pytest test_agent.py -v
 
 # Run a single test
 pytest test_agent.py::test_vision_distinguishes_colors -v
+
+# (Re)index the connected Obsidian vault into semantic search
+python index_vault.py
 ```
 
 All commands must be run from the `files/` directory. The virtual environment is in `venv/`.
@@ -93,6 +96,15 @@ ChromaDB (local, embedded, in `chroma_db/`) + Ollama embeddings (`nomic-embed-te
 - **`search_documents(query, doc_type="", top_k=4)`** does similarity search with an optional `{"type": {"$eq": doc_type}}` filter.
 - Files created by `transcribe_audio` / `structure_thoughts` / `log_improvement` auto-index via `_auto_index` (errors swallowed).
 
+## Obsidian vault integration
+
+An Obsidian vault is just a folder of Markdown files, so the agent connects to it at the **filesystem level** — no plugin or API. Set `OBSIDIAN_VAULT` in `.env` to the vault path to enable; when it's empty (or the path is missing) the agent falls back to the in-project `knowledge/` folder, which keeps first-run and the **test suite** (`conftest.py` never loads `.env`, so `VAULT_ENABLED` is `False` under `pytest`) behaving exactly as before.
+
+- **Single source of truth in `tools.py`.** With a vault configured, `KNOWLEDGE_DIR` and its `meetings/ideas/projects/reports/improvements` subdirs point at `<vault>/<OBSIDIAN_AI_SUBDIR>` (default `AI Assistant/`). `main.py` **imports** these constants (instead of redefining them against `_BASE_DIR`) so the HTTP endpoints and the agent's tools always agree on where notes live.
+- **Read the whole vault, write only the agent's subfolder.** The file-tool sandbox is generalised from one root to `_allowed_roots()` = project dir **+** vault (`_resolve_in_base` still resolves symlinks and rejects escapes — see `test_read_file_blocks_traversal`). So the agent can read/search every note, but `write_md_file` resolves relative paths under `KNOWLEDGE_DIR`, so its writes land in the `AI Assistant/` subfolder and the user's own notes are never overwritten.
+- **Obsidian-native notes.** Every note the agent writes gets YAML frontmatter (`_frontmatter()`: title/type/date/tags/source) plus a `[[wikilink]]` back to a per-type hub note (`_hub_link()` → `[[Meetings]]`, `[[Ideas]]`, …), so notes are filterable (tags/Dataview) and connected in the graph view. `write_md_file` only injects frontmatter when the model didn't write its own (`--- …`). `ensure_vault_home()` writes the `AI Assistant.md` Map-Of-Content home note (idempotent).
+- **Indexing the existing vault.** `index_vault()` walks the whole vault (skipping `.obsidian/`, `.trash/`, `.git/`, `node_modules/`) and `_index_file`s every `.md` into ChromaDB so `search_documents` recalls the user's *pre-existing* notes, not just agent output. Run `python index_vault.py` once after connecting (and to refresh — upserts replace stale chunks). `POST /api/knowledge/index-all` also covers the whole vault when one is configured, and `/api/status` returns `obsidian_vault` for the UI.
+
 ## Vision / multimodal
 
 Image turns are routed to a **dedicated vision model** — a separate `ChatOllama` invoked with **no tools** and a short `VISION_SYSTEM_PROMPT`. The route exists because not every model can see (`llama3.2` is text-only, and the older `gemma4:e4b` advertised a vision capability that didn't actually work in Ollama), and some Ollama vision models misbehave with tools bound or a long prompt.
@@ -116,6 +128,8 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 | `chats/` | Saved conversation JSON (`<thread_id>.json`) | No |
 | `transcriptions/`, `reports/` | Legacy paths — still read for backward compat | No |
 
+> When `OBSIDIAN_VAULT` is set, the `knowledge/*` folders above live inside the vault's `AI Assistant/` subfolder (not the project dir) — see **Obsidian vault integration**. `index_vault.py` indexes the user's existing vault notes alongside the agent's.
+
 ## Environment variables
 
 | Var | Purpose | Default |
@@ -124,6 +138,8 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 | `OLLAMA_BASE_URL` | Ollama host | `http://localhost:11434` |
 | `AGENT_MODEL` | Primary reasoning model (text + tools); the UI can override it per request | `gemma4:e4b` |
 | `VISION_MODEL` | Dedicated vision model for image turns | `gemma3:4b` |
+| `OBSIDIAN_VAULT` | Obsidian vault to connect (empty → in-project `knowledge/`) | — |
+| `OBSIDIAN_AI_SUBDIR` | Subfolder in the vault where the agent writes its notes | `AI Assistant` |
 | `EMBED_MODEL` | RAG embedding model | `nomic-embed-text` |
 | `WHISPER_MODEL` | faster-whisper size | `small` |
 | `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` / `LANGCHAIN_PROJECT` | LangSmith tracing | off |

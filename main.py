@@ -46,13 +46,18 @@ load_dotenv()  # must run before graph/tools are imported so env vars are set
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from graph import agent, build_agent
 from memory import load_memories, delete_memory_entry, clear_all_memories
-from tools import _index_file, set_agent_model, extract_search_sources
+from tools import (
+    _index_file, set_agent_model, extract_search_sources,
+    KNOWLEDGE_DIR, VAULT_DIR, VAULT_ENABLED, index_vault,
+)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
+# KNOWLEDGE_DIR is imported from tools so the agent's note-writing tools and these
+# HTTP endpoints always agree on where notes live — the Obsidian vault subfolder
+# when OBSIDIAN_VAULT is set, else the in-project knowledge/ folder.
 _BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 CHATS_DIR        = os.path.join(_BASE_DIR, "chats")
 AUDIO_IN_DIR     = os.path.join(_BASE_DIR, "audio_in")
-KNOWLEDGE_DIR    = os.path.join(_BASE_DIR, "knowledge")
 OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".ogg", ".flac", ".webm"}
 
@@ -452,6 +457,7 @@ def get_status():
         "tracing_enabled": tracing,
         "langsmith_project": project,
         "default_model": _DEFAULT_MODEL,
+        "obsidian_vault": VAULT_DIR if VAULT_ENABLED else None,
     }
 
 
@@ -522,13 +528,19 @@ def clear_memory():
 
 @app.post("/api/knowledge/index-all")
 def index_all_docs():
-    """Index all .md files in knowledge/ plus legacy transcriptions/ and reports/ dirs."""
+    """Index the whole knowledge base — the Obsidian vault (user notes + agent notes)
+    when one is configured, else the in-project knowledge/ — plus legacy dirs."""
     indexed = 0
-    for scan in [
-        KNOWLEDGE_DIR,
-        os.path.join(_BASE_DIR, "transcriptions"),
-        os.path.join(_BASE_DIR, "reports"),
-    ]:
+    if VAULT_ENABLED:
+        # KNOWLEDGE_DIR lives inside the vault, so index_vault() already covers it.
+        indexed += index_vault().get("indexed", 0)
+        legacy_scans = [os.path.join(_BASE_DIR, "transcriptions"),
+                        os.path.join(_BASE_DIR, "reports")]
+    else:
+        legacy_scans = [KNOWLEDGE_DIR,
+                        os.path.join(_BASE_DIR, "transcriptions"),
+                        os.path.join(_BASE_DIR, "reports")]
+    for scan in legacy_scans:
         if os.path.exists(scan):
             for root, _, files in os.walk(scan):
                 for fn in files:
