@@ -18,6 +18,17 @@ langchain-chroma==1.1.0
 # Audio transcription (local Whisper model — also needs ffmpeg on PATH)
 faster-whisper==1.2.1
 
+# Video understanding (process_video: yt-dlp fetch, ffmpeg scene-detect, Moondream
+# keyframe descriptions via HF transformers). ffmpeg must be on PATH.
+# NOTE: plain `pip install -r requirements.txt` gets the CPU torch wheel; for CUDA run
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+# first (the +cu128 build satisfies this pin, so -r won't downgrade it).
+yt-dlp==2026.6.9
+torch==2.11.0
+transformers==4.53.3
+einops==0.8.2
+accelerate==1.14.0
+
 # API
 fastapi==0.136.3
 uvicorn[standard]==0.48.0

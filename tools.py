@@ -42,6 +42,7 @@ IDEAS_DIR        = os.path.join(KNOWLEDGE_DIR, "ideas")
 PROJECTS_DIR     = os.path.join(KNOWLEDGE_DIR, "projects")
 REPORTS_DIR      = os.path.join(KNOWLEDGE_DIR, "reports")
 IMPROVEMENTS_DIR = os.path.join(KNOWLEDGE_DIR, "improvements")
+VIDEOS_DIR       = os.path.join(KNOWLEDGE_DIR, "videos")
 WORKSPACE_DIR    = os.path.join(_BASE_DIR, "workspace")
 _CHROMA_DIR      = os.path.join(_BASE_DIR, "chroma_db")
 # Legacy — kept so existing files in transcriptions/ still resolve via read_file
@@ -50,7 +51,7 @@ TRANSCRIPTIONS_DIR = os.path.join(_BASE_DIR, "transcriptions")
 # Ensure all runtime directories exist at import time (creates the agent's subfolder
 # tree inside the vault on first run — that subfolder IS the integration point).
 for _d in (MEETINGS_DIR, IDEAS_DIR, PROJECTS_DIR, REPORTS_DIR,
-           IMPROVEMENTS_DIR, WORKSPACE_DIR):
+           IMPROVEMENTS_DIR, VIDEOS_DIR, WORKSPACE_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
@@ -128,6 +129,7 @@ _TYPE_HUB = {
     "project":     "Projects",
     "report":      "Reports",
     "improvement": "Improvements",
+    "video":       "Videos",
 }
 
 
@@ -491,6 +493,36 @@ def transcribe_audio(file_path: str) -> str:
         return f"Error during transcription: {e}"
 
 
+# ── Video understanding ──────────────────────────────────────────────────────────
+# url → yt-dlp download → [Whisper transcript] + [ffmpeg scene-detect keyframes →
+# Moondream query()] → one timestamp-aligned markdown file in knowledge/videos/.
+# The pipeline lives in video_understanding.py and is imported lazily so tools.py
+# stays importable (and fast) when torch / transformers / yt-dlp aren't installed.
+
+@tool
+def process_video(url: str) -> str:
+    """
+    Analyze a video from a URL (YouTube, TikTok, X/Twitter): downloads it, transcribes
+    the speech, and describes what is shown on screen, merged into ONE timestamp-aligned
+    markdown file. Each line is "[MM:SS] SPOKEN: ..." (speech) or "[MM:SS] VISUAL: ..."
+    (on-screen text + scene description).
+
+    Use this whenever the user shares a video link and wants it summarised, fact-checked,
+    or discussed. Returns the saved file path plus the timeline (truncated if long — call
+    read_file on the path for the full version). Results are cached: re-running the same
+    video is instant, but a NEW video takes a few minutes to process — mention that.
+    """
+    try:
+        from video_understanding import process_video_impl
+    except ImportError as e:
+        return (f"Error: video processing dependencies missing ({e}). "
+                "Run: pip install yt-dlp torch transformers einops accelerate")
+    try:
+        return process_video_impl(url)
+    except Exception as e:   # never raise — an exception crashes the whole agent run
+        return f"Error: video processing failed ({e})"
+
+
 # ── Long-term memory tools ───────────────────────────────────────────────────────
 
 @tool
@@ -572,6 +604,7 @@ def _infer_doc_type(abs_path: str, doc_type: str = "") -> str:
         "projects":     "project",
         "reports":      "report",
         "improvements": "improvement",
+        "videos":       "video",
         "transcriptions": "meeting",   # legacy folder
     }.get(parent, "document")
 
@@ -703,6 +736,7 @@ def ensure_vault_home() -> str | None:
         "- [[Projects]] — project plans\n"
         "- [[Reports]] — research & reports\n"
         "- [[Improvements]] — friction & bug log\n"
+        "- [[Videos]] — video breakdowns (spoken + visual timelines)\n"
     )
     with open(home, "w", encoding="utf-8") as f:
         f.write(_frontmatter(title=VAULT_AI_SUBDIR, note_type="moc", tags=["moc"]) + body)
@@ -1032,6 +1066,7 @@ TOOLS = [
     read_file,
     write_md_file,
     transcribe_audio,
+    process_video,
     save_memory,
     list_memories,
     index_document,

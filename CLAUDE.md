@@ -17,6 +17,11 @@ pytest test_agent.py -v
 # Run a single test
 pytest test_agent.py::test_vision_distinguishes_colors -v
 
+# Video pipeline tests (ffmpeg / cached-Moondream gated; skip cleanly otherwise)
+pytest test_video.py -v
+# Full video e2e (opt-in: downloads a real 19s YouTube clip end to end)
+$env:RUN_VIDEO_E2E='1'; pytest test_video.py -v
+
 # (Re)index the connected Obsidian vault into semantic search
 python index_vault.py
 ```
@@ -62,17 +67,19 @@ START → call_model → (tool calls?) → call_tools → call_model → ... →
 | `prompts.py` | `SYSTEM_PROMPT` (full, tool-aware) + `VISION_SYSTEM_PROMPT` (short, image turns) |
 | `memory.py` | Long-term memory CRUD over `memory.json` + `format_memories_for_prompt()` |
 | `app.py` | Streamlit UI: model selector, chat persistence, image upload, transcription, memory + knowledge sidebars |
+| `video_understanding.py` | `process_video` pipeline: yt-dlp → Whisper + scene-detect → Moondream → merged timeline |
 | `conftest.py` | Puts `files/` on `sys.path` so `pytest` resolves sibling modules |
 
 ## Tools
 
-`TOOLS` (13): `brave_search`, `python_repl`, `list_directory`, `read_file`, `write_md_file`, `transcribe_audio`, `save_memory`, `list_memories`, `index_document`, `search_documents`, `structure_thoughts`, `log_improvement`, `analyze_improvements`.
+`TOOLS` (14): `brave_search`, `python_repl`, `list_directory`, `read_file`, `write_md_file`, `transcribe_audio`, `process_video`, `save_memory`, `list_memories`, `index_document`, `search_documents`, `structure_thoughts`, `log_improvement`, `analyze_improvements`.
 
 Adding a new tool: define it with `@tool` in `tools.py`, append it to `TOOLS` at the bottom. The agent picks it up automatically — no changes to `graph.py` needed.
 
 - **`brave_search`** returns up to **5** results as a readable numbered `[n] title / snippet / Source: <url>` list (not raw JSON), so the model synthesises instead of pasting. An optional `freshness` arg (`pd`/`pw`/`pm`/`py` = past day/week/month/year) maps to Brave's recency filter for time-sensitive queries; default off so evergreen searches are unaffected. It degrades gracefully: if `BRAVE_SEARCH_API_KEY` is unset or the request fails, it returns an `Error: …` string telling the model to answer from its own knowledge — it never raises (raising crashes the whole agent run). The non-tool helper `extract_search_sources()` parses that output back into `{title, url}` so `main.py` can attach clickable sources to the chat bubble.
 - **`python_repl`** executes Python **in-process** (no real sandbox) and is **disabled by default** — set `ENABLE_CODE_EXECUTION=true` to enable it. The `os.chdir(workspace/)` prefix only sets the working dir so generated files land in `workspace/`; it is not a security boundary.
 - **`transcribe_audio`** lazy-loads faster-whisper into `_whisper_cache` (~970 MB for `small`, downloads to `~/.cache/huggingface/hub/`). Saves transcripts to `knowledge/meetings/<stem>.md` and auto-indexes them. Set `WHISPER_MODEL=medium` for better non-English/noisy accuracy.
+- **`process_video`** turns a YouTube / TikTok / X URL into one timestamp-aligned SPOKEN+VISUAL timeline note — see **Video understanding** below.
 - **`structure_thoughts` / `analyze_improvements`** call a secondary `temperature=0` LLM via `_get_structure_llm()`. `build_agent()` calls `set_agent_model()` so this secondary LLM tracks the active model.
 
 ## FastAPI backend (`main.py`)
@@ -113,6 +120,24 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 - `call_model` detects an `image_url` part in the latest human message and invokes the plain vision LLM with `VISION_SYSTEM_PROMPT` only. Tool use + full prompt resume on the next text turn. The two models swap in/out of VRAM as you alternate (a few seconds' load latency — normal).
 - `app.py` builds the multimodal `HumanMessage` (content list with a `data:` URL). Because `st.file_uploader` can return `None` on the `st.chat_input` rerun, the uploaded image bytes are stashed in `st.session_state["_queued_img"]` and consumed on submit.
 
+## Video understanding (`process_video`)
+
+`process_video(url)` (thin `@tool` in `tools.py` → pipeline in `video_understanding.py`) turns a YouTube / TikTok / X video into **one timestamp-aligned markdown note** in `knowledge/videos/`, interleaving what is said and what is shown so the agent can fact-check/summarise inside its normal ReAct loop:
+
+```
+url → yt-dlp (≤720p, single file = single clock) → [faster-whisper segments]
+    + [ffmpeg scene-detect keyframes → Moondream query()]
+    → interleaved [MM:SS] SPOKEN/VISUAL timeline → knowledge/videos/<extractor>-<id>.md
+```
+
+- **Scene-change frame selection, not flat fps.** `select='gt(scene,T)'`, default `T=0.08` (`VIDEO_SCENE_THRESHOLD`). ffmpeg's scene score is a **luma-only** frame diff: hard cuts score ~0.3–0.8, but slide/caption changes (most of the frame unchanged) only ~0.05–0.2 — hence the low default; chroma-only changes are invisible at *any* threshold (which is why the test fixture uses luma-distinct colors — CSS red→green scores ≈0). The first frame is always kept, long static stretches get one anchor frame per `VIDEO_FRAME_MAX_GAP` (60 s), and everything is capped at `VIDEO_MAX_FRAMES` (40) by even thinning — so over-firing degrades to uniform sampling while talking-heads stay sparse (self-scaling).
+- **Moondream runs locally** (HF transformers, CUDA fp16 when available) with the targeted prompt *"Transcribe any text visible in the image, then briefly describe what is shown."* via `query()` — not generic `caption()`. Pinned to `vikhyatk/moondream2 @ 2025-06-21`; swap via `MOONDREAM_MODEL` / `MOONDREAM_REVISION` (e.g. `moondream/moondream3-preview`, same interface). The model is loaded per video and **released afterwards** (gc + `cuda.empty_cache`) so it doesn't sit on VRAM next to the Ollama chat model. OCR is English-optimised — Swedish on-screen text may be weaker; the Whisper side is multilingual.
+- **Whisper reuse:** same `_get_whisper_model()` as `transcribe_audio`; faster-whisper decodes the audio track straight from the mp4 (PyAV), and `vad_filter=True` stops music-only stretches from hallucinating lyrics.
+- **Cache = the output file** (`<extractor>-<video_id>.md`): a repeat call costs one metadata probe, no download. Notes get the standard frontmatter + `[[Videos]]` hub link and auto-index as `type: video` (searchable via `search_documents(..., "video")`).
+- **Return contract:** path **plus** the timeline (truncated at ~6 000 chars) — one tool call gives the model everything, because small models often skip a chained `read_file` call.
+- **Lazy imports everywhere:** `tools.py` imports `video_understanding` inside the tool function; `video_understanding` imports `tools` / torch / yt_dlp inside functions (no cycle, no torch cost at startup, `tools.py` still imports when video deps are missing). Dirs are looked up late (`tools.VIDEOS_DIR`) so tests can repoint them.
+- Needs **ffmpeg on PATH**; refuses videos over `VIDEO_MAX_DURATION` (3600 s); returns `Error: …` strings (never raises — a raise crashes the agent run).
+
 ## Data directories
 
 | Directory / file | Contents | Committed |
@@ -122,6 +147,7 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 | `knowledge/ideas/` | `structure_thoughts` output | No (`.gitkeep`) |
 | `knowledge/projects/` `reports/` | Project plans / reports | No (`.gitkeep`) |
 | `knowledge/improvements/` | `log_improvement` entries | No (`.gitkeep`) |
+| `knowledge/videos/` | `process_video` timelines — also the cache (keyed `<extractor>-<id>.md`) | No (`.gitkeep`) |
 | `workspace/` | Files written by `python_repl` | No (`.gitkeep`) |
 | `chroma_db/` | ChromaDB vector store | No |
 | `memory.json` | Long-term memory | No |
@@ -142,6 +168,11 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 | `OBSIDIAN_AI_SUBDIR` | Subfolder in the vault where the agent writes its notes | `AI Assistant` |
 | `EMBED_MODEL` | RAG embedding model | `nomic-embed-text` |
 | `WHISPER_MODEL` | faster-whisper size | `small` |
+| `VIDEO_SCENE_THRESHOLD` | Keyframe scene-score cutoff (luma diff, 0–1) | `0.08` |
+| `VIDEO_MAX_FRAMES` | Keyframe cap per video (each = one Moondream call) | `40` |
+| `VIDEO_FRAME_MAX_GAP` | Max seconds of static video without an anchor frame | `60` |
+| `VIDEO_MAX_DURATION` | Longest processable video, seconds | `3600` |
+| `MOONDREAM_MODEL` / `MOONDREAM_REVISION` | Frame-description model (HF, pinned) | `vikhyatk/moondream2` @ `2025-06-21` |
 | `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` / `LANGCHAIN_PROJECT` | LangSmith tracing | off |
 
 ## Testing
@@ -154,7 +185,13 @@ Image turns are routed to a **dedicated vision model** — a separate `ChatOllam
 - **RAG** → retrieves a unique invented fact (proves embeddings + vector search)
 - **multi-turn tool use** → a 5-turn conversation (every turn drives `python_repl`) whose final answer must combine the products from turns 2 and 4 (proves the `MemorySaver` checkpointer carries cross-turn context and the agent picks the right two values, not the turn-1/3 distractors)
 
-Tests `skipif` Ollama is down or a model isn't pulled. Fixtures isolate side effects: `preserve_memory` snapshots/restores `memory.json`; `temp_vectorstore` points ChromaDB at a throwaway dir. That's isolation, not mocking — the real LLM/embeddings/vector search still run.
+`test_video.py` follows the same principle for the video pipeline (no Ollama needed):
+
+- **scene detection** → a synthetic 3-scene video must yield exactly 3 keyframes at the *right* timestamps (flat sampling or a broken showinfo parser fails it); scene colors must differ in **luma** — ffmpeg's metric ignores chroma
+- **Moondream OCR** → must read an unguessable rendered string ("ZEBRA 9314") via `query()` — skips unless the weights are already cached (`MOONDREAM_TEST_DOWNLOAD=1` allows the ~4 GB first pull)
+- **e2e** (opt-in `RUN_VIDEO_E2E=1`) → a real 19 s clip must produce interleaved SPOKEN **and** VISUAL lines that mention what the clip actually contains ("elephants"), then hit the cache on the second call
+
+Tests `skipif` Ollama is down or a model isn't pulled (video tests: ffmpeg missing / weights not cached / e2e not opted in). Fixtures isolate side effects: `preserve_memory` snapshots/restores `memory.json`; `temp_vectorstore` points ChromaDB at a throwaway dir; `temp_videos_dir` repoints the video output/cache. That's isolation, not mocking — the real LLM/embeddings/vector search still run.
 
 **Verify with the exact command the user runs** (`pytest …`, not just `python -m pytest …`) — they differ in `sys.path` handling.
 

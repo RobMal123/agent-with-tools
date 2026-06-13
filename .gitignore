@@ -36,6 +36,8 @@ knowledge/reports/*
 !knowledge/reports/.gitkeep
 knowledge/improvements/*
 !knowledge/improvements/.gitkeep
+knowledge/videos/*
+!knowledge/videos/.gitkeep
 
 # ── Sandboxed REPL workspace ────────────────────────────────────────────────────
 workspace/*
